@@ -7,6 +7,7 @@ GPU is preferred when CUDA is available, with CPU kept as a fallback.
 import gc
 import os
 import time
+import traceback
 
 # Set Hugging Face cache directories before importing diffusers/transformers.
 os.environ.setdefault("HF_HOME", "/app/cache")
@@ -106,7 +107,7 @@ def build_pipeline(device):
     print(f"Loading {MODEL_ID} on {device}")
     pipeline = StableDiffusionPipeline.from_pretrained(
         MODEL_ID,
-        torch_dtype=dtype,
+        dtype=dtype,
         safety_checker=None,
         requires_safety_checker=False,
         use_safetensors=True,
@@ -189,42 +190,22 @@ def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, w
     clear_memory()
 
     try:
-        if device_choice == "GPU" and CUDA_AVAILABLE:
-            try:
-                load_gpu_pipeline()
-                image = generate_with_pipeline(
-                    gpu_pipeline,
-                    prompt,
-                    "GPU",
-                    int(num_inference_steps),
-                    float(guidance_scale),
-                    width,
-                    height,
-                )
-                device_used = "GPU"
-            except torch.cuda.OutOfMemoryError:
-                clear_memory()
-                return (
-                    None,
-                    "GPU ran out of memory. Try 512x512, fewer steps, or CPU mode.",
-                )
-            except Exception as exc:
-                print(f"GPU generation failed: {exc}")
-                if os.getenv("DISABLE_CPU_FALLBACK", "0").lower() in {"1", "true", "yes"}:
-                    raise
-                print("Falling back to CPU generation")
-                load_cpu_pipeline()
-                image = generate_with_pipeline(
-                    cpu_pipeline,
-                    prompt,
-                    "CPU",
-                    int(num_inference_steps),
-                    float(guidance_scale),
-                    width,
-                    height,
-                )
-                device_used = "CPU fallback"
-        else:
+        if device_choice == "GPU":
+            if not CUDA_AVAILABLE:
+                return None, "GPU was selected, but CUDA is not available in this container."
+
+            load_gpu_pipeline()
+            image = generate_with_pipeline(
+                gpu_pipeline,
+                prompt,
+                "GPU",
+                int(num_inference_steps),
+                float(guidance_scale),
+                width,
+                height,
+            )
+            device_used = "GPU"
+        elif device_choice == "CPU":
             load_cpu_pipeline()
             image = generate_with_pipeline(
                 cpu_pipeline,
@@ -236,16 +217,36 @@ def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, w
                 height,
             )
             device_used = "CPU"
+        else:
+            return None, f"Unknown device choice: {device_choice}"
 
         elapsed = time.time() - start_time
         clear_memory()
         return image, f"Generated using {device_used} in {elapsed:.1f}s."
 
+    except torch.cuda.OutOfMemoryError as exc:
+        elapsed = time.time() - start_time
+        clear_memory()
+        detail = (
+            f"GPU ran out of memory after {elapsed:.1f}s.\n"
+            f"Error: {exc}\n\n"
+            "Try 512x512, fewer steps, or restart the container to clear GPU state."
+        )
+        print(detail)
+        return None, detail
     except Exception as exc:
         elapsed = time.time() - start_time
         clear_memory()
-        print(f"Generation failed after {elapsed:.1f}s: {exc}")
-        return None, f"Generation failed after {elapsed:.1f}s: {exc}"
+        details = traceback.format_exc()
+        device_label = device_choice if device_choice in {"GPU", "CPU"} else "selected device"
+        message = (
+            f"{device_label} generation failed after {elapsed:.1f}s.\n"
+            f"Error type: {type(exc).__name__}\n"
+            f"Error: {exc}\n\n"
+            f"Details:\n{details}"
+        )
+        print(message)
+        return None, message
 
 
 def create_interface():
