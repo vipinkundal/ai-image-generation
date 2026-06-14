@@ -5,9 +5,12 @@ diffusers>=0.30,<0.36
 huggingface_hub>=0.24,<1
 
 # Web interface
-gradio>=4.44,<5
-fastapi>=0.112,<1
-uvicorn>=0.30,<1
+gradio==4.44.1
+gradio-client==1.3.0
+fastapi>=0.112,<0.115
+starlette>=0.37.2,<0.39
+pydantic>=2.8,<2.11
+uvicorn>=0.30,<0.31
 
 # Image processing and model loading
 Pillow>=10.4,<12

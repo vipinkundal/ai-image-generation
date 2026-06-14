@@ -342,6 +342,8 @@ if __name__ == "__main__":
 
     try:
         app = create_interface()
+        print("Open in your browser: http://localhost:7860")
+        print("Docker binds the app inside the container on 0.0.0.0:7860.")
         app.launch(
             server_name="0.0.0.0",
             server_port=7860,
