@@ -3,6 +3,8 @@ Simple AI Image Generator
 GPU (default/preferred) and CPU modes available
 """
 
+import os
+
 import gradio as gr
 import torch
 from PIL import Image
@@ -31,6 +33,27 @@ else:
 # Global pipeline variables
 gpu_pipeline = None
 cpu_pipeline = None
+MODEL_ID = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
+CACHE_DIR = os.getenv("HF_HOME", "/app/cache")
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+OFFLINE_MODE = os.getenv("HF_HUB_OFFLINE", "0").lower() in {"1", "true", "yes"}
+
+def set_offline_mode(enabled):
+    """Switch Hugging Face model loading between online and cached-only modes."""
+    global OFFLINE_MODE, gpu_pipeline, cpu_pipeline
+
+    enabled = bool(enabled)
+    if OFFLINE_MODE == enabled:
+        return
+
+    OFFLINE_MODE = enabled
+    os.environ["HF_HUB_OFFLINE"] = "1" if enabled else "0"
+    print(f"Offline model loading set to: {OFFLINE_MODE}")
+
+    if gpu_pipeline is not None or cpu_pipeline is not None:
+        print("Offline mode changed. Unloading pipelines so the next load uses the selected mode.")
+        gpu_pipeline = None
+        cpu_pipeline = None
 
 def load_gpu_pipeline():
     """Load Stable Diffusion pipeline for GPU"""
@@ -39,10 +62,13 @@ def load_gpu_pipeline():
         print("🔄 Loading GPU pipeline...")
         try:
             gpu_pipeline = StableDiffusionPipeline.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
+                MODEL_ID,
                 torch_dtype=torch.float16,
                 safety_checker=None,
-                requires_safety_checker=False
+                requires_safety_checker=False,
+                cache_dir=CACHE_DIR,
+                token=HF_TOKEN,
+                local_files_only=OFFLINE_MODE
             )
             gpu_pipeline = gpu_pipeline.to("cuda")
             gpu_pipeline.enable_attention_slicing()
@@ -61,10 +87,13 @@ def load_cpu_pipeline():
         print("🔄 Loading CPU pipeline...")
         try:
             cpu_pipeline = StableDiffusionPipeline.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
+                MODEL_ID,
                 torch_dtype=torch.float32,
                 safety_checker=None,
-                requires_safety_checker=False
+                requires_safety_checker=False,
+                cache_dir=CACHE_DIR,
+                token=HF_TOKEN,
+                local_files_only=OFFLINE_MODE
             )
             cpu_pipeline = cpu_pipeline.to("cpu")
             print("✅ CPU pipeline loaded successfully")
@@ -75,10 +104,11 @@ def load_cpu_pipeline():
             return False
     return True
 
-def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, width, height):
+def generate_image(prompt, device_choice, offline_mode, num_inference_steps, guidance_scale, width, height):
     """Generate image using selected device"""
+    set_offline_mode(offline_mode)
     
-    if not prompt.strip():
+    if not (prompt or "").strip():
         return None, "❌ Please enter a prompt"
     
     start_time = time.time()
@@ -113,7 +143,11 @@ def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, w
             device_used = "CPU"
         
         generation_time = time.time() - start_time
-        status = f"✅ Generated using {device_used} in {generation_time:.1f}s"
+        offline_status = "on" if OFFLINE_MODE else "off"
+        status = (
+            f"✅ Generated using {device_used} in {generation_time:.1f}s\n"
+            f"Offline model loading: {offline_status}"
+        )
         
         return image, status
         
@@ -146,6 +180,12 @@ def create_interface():
                     value="GPU" if CUDA_AVAILABLE else "CPU",
                     label="Device",
                     info="GPU is preferred when available"
+                )
+
+                offline_toggle = gr.Checkbox(
+                    label="Offline Mode",
+                    value=OFFLINE_MODE,
+                    info="Use cached Hugging Face model files only."
                 )
                 
                 with gr.Row():
@@ -193,13 +233,16 @@ def create_interface():
             **GPU Name:** {torch.cuda.get_device_name(0) if CUDA_AVAILABLE else 'N/A'}
             **PyTorch Version:** {torch.__version__}
             **Default Device:** {'GPU' if CUDA_AVAILABLE else 'CPU'}
+            **Model:** {MODEL_ID}
+            **Cache Directory:** {CACHE_DIR}
+            **Offline Model Loading:** {OFFLINE_MODE}
             """
             gr.Markdown(info_text)
         
         # Connect the generate button
         generate_btn.click(
             fn=generate_image,
-            inputs=[prompt_input, device_choice, steps_slider, guidance_slider, width_slider, height_slider],
+            inputs=[prompt_input, device_choice, offline_toggle, steps_slider, guidance_slider, width_slider, height_slider],
             outputs=[output_image, status_text]
         )
     
@@ -211,13 +254,7 @@ if __name__ == "__main__":
     print(f"🔍 CUDA Available: {CUDA_AVAILABLE}")
     
     try:
-        # Pre-load the default pipeline
-        if CUDA_AVAILABLE:
-            print("🔄 Pre-loading GPU pipeline...")
-            load_gpu_pipeline()
-        else:
-            print("🔄 Pre-loading CPU pipeline...")
-            load_cpu_pipeline()
+        print("🔄 Pipelines will load on first generation...")
         
         # Create and launch interface
         print("🔄 Creating Gradio interface...")
@@ -233,7 +270,7 @@ if __name__ == "__main__":
         interface.launch(
             server_name="0.0.0.0",
             server_port=7860,
-            share=True,  # Enable share link for external access
+            share=False,
             show_error=True,
             debug=True,  # Enable debug mode
             inbrowser=False,  # Don't auto-open browser

@@ -24,7 +24,7 @@ MODEL_ID = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
 CACHE_DIR = os.getenv("HF_HOME", "/app/cache")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 OFFLINE_MODE = os.getenv("HF_HUB_OFFLINE", "0").lower() in {"1", "true", "yes"}
-PRELOAD_GPU = os.getenv("PRELOAD_GPU", "1").lower() in {"1", "true", "yes"}
+PRELOAD_GPU = os.getenv("PRELOAD_GPU", "0").lower() in {"1", "true", "yes"}
 ENABLE_ATTENTION_SLICING = os.getenv("ENABLE_ATTENTION_SLICING", "0").lower() in {
     "1",
     "true",
@@ -190,6 +190,25 @@ def clear_memory(release_cuda_cache=False):
         torch.cuda.empty_cache()
 
 
+def set_offline_mode(enabled):
+    """Switch Hugging Face model loading between online and cached-only modes."""
+    global OFFLINE_MODE, gpu_pipeline, cpu_pipeline
+
+    enabled = bool(enabled)
+    if OFFLINE_MODE == enabled:
+        return
+
+    OFFLINE_MODE = enabled
+    os.environ["HF_HUB_OFFLINE"] = "1" if enabled else "0"
+    print(f"Offline model loading set to: {OFFLINE_MODE}")
+
+    if gpu_pipeline is not None or cpu_pipeline is not None:
+        print("Offline mode changed. Unloading pipelines so the next load uses the selected mode.")
+        gpu_pipeline = None
+        cpu_pipeline = None
+        clear_memory(release_cuda_cache=True)
+
+
 def build_pipeline(device):
     """Load Stable Diffusion for the requested device."""
     is_gpu = device == "cuda"
@@ -286,6 +305,7 @@ def generate_with_pipeline(pipeline, prompt, device, steps, guidance, width, hei
 def generate_image(
     prompt,
     device_choice,
+    offline_mode,
     gpu_memory_percent,
     num_inference_steps,
     guidance_scale,
@@ -293,6 +313,8 @@ def generate_image(
     height,
 ):
     """Generate an image using the selected device."""
+    set_offline_mode(offline_mode)
+
     prompt = (prompt or "").strip()
     if not prompt:
         return None, "Please enter a prompt."
@@ -355,7 +377,13 @@ def generate_image(
         size_status = f"Generated at {generation_width}x{generation_height}."
         if will_upscale:
             size_status += f" Upscaled to {width}x{height} output pixels."
-        return image, f"Generated using {device_used} in {elapsed:.1f}s.\n{size_status}\n{memory_status}"
+        offline_status = "Offline model loading: on." if OFFLINE_MODE else "Offline model loading: off."
+        return image, (
+            f"Generated using {device_used} in {elapsed:.1f}s.\n"
+            f"{size_status}\n"
+            f"{memory_status}\n"
+            f"{offline_status}"
+        )
 
     except torch.cuda.OutOfMemoryError as exc:
         elapsed = time.time() - start_time
@@ -403,6 +431,12 @@ def create_interface():
                     value="GPU" if CUDA_AVAILABLE else "CPU",
                     label="Device",
                     info="GPU is preferred when available.",
+                )
+
+                offline_toggle = gr.Checkbox(
+                    label="Offline Mode",
+                    value=OFFLINE_MODE,
+                    info="Use cached Hugging Face model files only.",
                 )
 
                 gpu_memory_slider = gr.Slider(
@@ -486,6 +520,7 @@ def create_interface():
             **PyTorch CUDA Runtime:** {cuda_runtime}
             **Model:** {MODEL_ID}
             **Cache Directory:** {CACHE_DIR}
+            **Offline Model Loading:** {OFFLINE_MODE}
             **GPU Preload:** {PRELOAD_GPU}
             **Attention Slicing:** {ENABLE_ATTENTION_SLICING}
             **Torch Compile:** {ENABLE_TORCH_COMPILE}
@@ -500,6 +535,7 @@ def create_interface():
             inputs=[
                 prompt_input,
                 device_choice,
+                offline_toggle,
                 gpu_memory_slider,
                 steps_slider,
                 guidance_slider,

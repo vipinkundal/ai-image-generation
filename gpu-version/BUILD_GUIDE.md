@@ -97,7 +97,8 @@ volumes:
 - `model_cache:/app/cache`
 - `huggingface_cache:/app/cache/hub`
 
-Set `HF_HUB_OFFLINE=1` only after the model is already cached.
+Use the **Offline Mode** checkbox in the web interface, or set
+`HF_HUB_OFFLINE=1`, only after the model is already cached.
 
 ### Preload The Model Into A Docker Volume
 
@@ -140,7 +141,8 @@ HUGGING_FACE_HUB_TOKEN=...
 
 - `MODEL_ID`: override the model, default is `runwayml/stable-diffusion-v1-5`
 - `HF_HUB_OFFLINE=1`: force cached model files only
-- `PRELOAD_GPU=1`: load the GPU pipeline at app startup, default enabled
+- `PRELOAD_GPU=1`: load the GPU pipeline at app startup, default disabled so
+  the UI offline switch can be selected before model loading
 - `GPU_MEMORY_PERCENT=80`: default PyTorch GPU memory limit shown in the UI
 - `MAX_GENERATION_DIMENSION=1024`: largest side used for the actual diffusion
   pass before upscaling

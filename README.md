@@ -39,13 +39,15 @@ docker-compose up --build
 - **CPU Version**: CPU-optimized without GPU dependencies
 - **Separate Dependencies**: No version conflicts between GPU/CPU packages
 - **Web Interface**: Gradio interface with device selection
-- **Share Links**: Public URLs for external access
+- **Offline Mode Toggle**: Use cached Hugging Face model files only after the model is downloaded
 
 ## 📡 Access
 
 Both versions will be available at:
 - **Local**: http://localhost:7860
-- **Share Link**: Displayed in console output
+
+The web interface is local/LAN only by default. Public Gradio share links are
+disabled so the app can run offline once dependencies and model files are cached.
 
 ## 🔧 Manual Build (Alternative)
 
