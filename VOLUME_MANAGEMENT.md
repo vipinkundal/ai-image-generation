@@ -7,7 +7,7 @@ This project uses Docker named volumes to persist downloaded models between cont
 
 ### GPU Version
 - **model_cache**: Stores application-specific model cache in `/app/cache`
-- **huggingface_cache**: Stores HuggingFace models in `/root/.cache/huggingface`
+- **huggingface_cache**: Stores Hugging Face Hub cache in `/app/cache/hub`
 - **Port**: 7860
 
 ### CPU Version  
@@ -112,5 +112,5 @@ If you encounter permission issues, the volumes are managed by Docker and should
 
 The volume configuration uses:
 - **Named volumes**: Better performance and management than bind mounts
-- **Dual cache paths**: Both `/app/cache` and `/root/.cache/huggingface` for comprehensive caching
+- **Dual cache paths**: GPU uses `/app/cache` and `/app/cache/hub`; CPU keeps its existing `/app/cache` and `/root/.cache/huggingface` paths
 - **Separate volumes**: GPU and CPU versions have isolated caches to prevent conflicts

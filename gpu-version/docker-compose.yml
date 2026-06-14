@@ -1,20 +1,25 @@
-version: '3.8'
-
 services:
   ai-image-generator-gpu:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
     ports:
       - "7860:7860"
     volumes:
       - model_cache:/app/cache
-      - huggingface_cache:/root/.cache/huggingface
+      - huggingface_cache:/app/cache/hub
     environment:
       - CUDA_VISIBLE_DEVICES=0
       - NVIDIA_VISIBLE_DEVICES=all
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7860
+      # Runtime performance settings
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
+      - CUDA_LAUNCH_BLOCKING=0
+      - TORCH_CUDNN_V8_API_ENABLED=1
+      - TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
     restart: unless-stopped
     deploy:
       resources:
@@ -23,6 +28,13 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+        limits:
+          memory: 24G  # Increased for RTX 5080's large VRAM
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import torch; assert torch.cuda.is_available()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   model_cache:

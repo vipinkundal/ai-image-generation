@@ -1,50 +1,73 @@
-# GPU-Optimized Dockerfile for AI Image Generator
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# GPU Dockerfile for AI Image Generator.
+#
+# RTX 50-series cards are Blackwell GPUs and need CUDA/PyTorch builds that
+# support sm_120. CUDA 12.1 / PyTorch 2.4-era builds only cover older
+# architectures, so use official CUDA 12.8 PyTorch wheels instead of compiling
+# PyTorch from source in this project image.
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 WORKDIR /app
 
-# Set environment variables for GPU performance
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV CUDA_VISIBLE_DEVICES=0
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CUDA_VISIBLE_DEVICES=0 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    HF_HOME=/app/cache \
+    HF_HUB_CACHE=/app/cache/hub \
+    HUGGINGFACE_HUB_CACHE=/app/cache/hub \
+    HF_HUB_DOWNLOAD_TIMEOUT=600 \
+    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True \
+    CUDA_LAUNCH_BLOCKING=0 \
+    TORCH_CUDNN_V8_API_ENABLED=1
 
-# HuggingFace cache settings
-ENV HF_HOME=/app/cache
-ENV TRANSFORMERS_CACHE=/app/cache
-ENV HF_HUB_CACHE=/app/cache
-ENV HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
-
-# Network timeout settings
-ENV HF_HUB_DOWNLOAD_TIMEOUT=600
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
-    build-essential \
+    git \
+    python3 \
+    python3-pip \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install requirements
-COPY requirements.txt .
+RUN python3 -m pip install --upgrade pip setuptools wheel
 
+# Install PyTorch separately so its CUDA wheel index does not affect ordinary
+# Python package resolution.
+RUN python3 -m pip install \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
 
-# Install Python and pip
-RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/apt/lists/*
-RUN pip3 install --no-cache-dir --upgrade pip
+COPY requirements-no-torch.txt .
+RUN python3 -m pip install -r requirements-no-torch.txt
 
-# Install all requirements (including torch/torchvision/torchaudio)
-RUN pip3 install --no-cache-dir -r requirements.txt
-
-# Copy application
 COPY app.py .
 
-# Create cache directories
-RUN mkdir -p /app/cache /root/.cache/huggingface
+RUN mkdir -p /app/cache /app/cache/hub && \
+    printf '%s\n' \
+      '#!/bin/bash' \
+      'set -e' \
+      'echo "GPU and PyTorch verification"' \
+      'python3 - <<'"'"'PY'"'"'' \
+      'import sys' \
+      'import torch' \
+      'print(f"Python: {sys.version.split()[0]}")' \
+      'print(f"PyTorch: {torch.__version__}")' \
+      'print(f"PyTorch CUDA runtime: {torch.version.cuda}")' \
+      'print(f"CUDA available: {torch.cuda.is_available()}")' \
+      'if torch.cuda.is_available():' \
+      '    for idx in range(torch.cuda.device_count()):' \
+      '        props = torch.cuda.get_device_properties(idx)' \
+      '        capability = ".".join(map(str, torch.cuda.get_device_capability(idx)))' \
+      '        print(f"GPU {idx}: {props.name} ({props.total_memory / 1024**3:.1f} GB, sm_{capability.replace(chr(46), chr(95))})")' \
+      '    x = torch.randn(16, 16, device="cuda")' \
+      '    print(f"CUDA test tensor mean: {x.mean().item():.4f}")' \
+      'else:' \
+      '    raise SystemExit("CUDA is not available inside the container")' \
+      'PY' \
+      > /app/verify-system.sh && chmod +x /app/verify-system.sh
 
-# Expose port
 EXPOSE 7860
 
-# Run application with verbose output
-CMD ["python3", "-u", "app.py"]
+CMD ["/bin/bash", "-c", "/app/verify-system.sh && python3 -u app.py"]

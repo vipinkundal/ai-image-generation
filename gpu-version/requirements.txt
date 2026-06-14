@@ -1,24 +1,9 @@
-# GPU Version Requirements - Optimized for NVIDIA GPUs
---extra-index-url https://download.pytorch.org/whl/nightly/cu121
-torch --pre
-torchvision --pre
-torchaudio --pre
-transformers==4.30.2
-diffusers==0.21.4
-huggingface_hub==0.16.4
-
-# Web interface with stable versions
-gradio==3.50.2
-fastapi==0.104.1
-uvicorn==0.24.0
-
-# Image processing
-Pillow==10.0.1
-
-# Utilities
-safetensors==0.4.0
-accelerate==0.24.0
-
-# GPU optimizations
-xformers
-triton>=2.0.0
+# Manual GPU environment helper.
+#
+# For Docker builds, use the Dockerfile. For a local virtual environment, install
+# PyTorch first with:
+#
+#   python3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#
+# Then install this file.
+-r requirements-no-torch.txt

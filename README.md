@@ -35,7 +35,7 @@ docker-compose up --build
 
 ## 🎯 Features
 
-- **GPU Version**: CUDA-optimized with xformers and triton for fast generation
+- **GPU Version**: CUDA 12.8/PyTorch GPU runtime suitable for RTX 50-series cards
 - **CPU Version**: CPU-optimized without GPU dependencies
 - **Separate Dependencies**: No version conflicts between GPU/CPU packages
 - **Web Interface**: Gradio interface with device selection

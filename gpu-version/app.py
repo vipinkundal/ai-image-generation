@@ -1,428 +1,356 @@
 """
-Simple AI Image Generator
-GPU (default/preferred) and CPU modes available
+Simple AI Image Generator.
+
+GPU is preferred when CUDA is available, with CPU kept as a fallback.
 """
+
+import gc
+import os
+import time
+
+# Set Hugging Face cache directories before importing diffusers/transformers.
+os.environ.setdefault("HF_HOME", "/app/cache")
+os.environ.setdefault("HF_HUB_CACHE", "/app/cache/hub")
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/app/cache/hub")
 
 import gradio as gr
 import torch
-from PIL import Image
-import time
-import os
-import gc
-import gc
+from diffusers import StableDiffusionPipeline
 
-# Set HuggingFace cache directory before importing transformers/diffusers
-os.environ['HF_HOME'] = '/app/cache'
-os.environ['TRANSFORMERS_CACHE'] = '/app/cache'
-os.environ['HF_HUB_CACHE'] = '/app/cache'
-os.environ['HUGGINGFACE_HUB_CACHE'] = '/root/.cache/huggingface'
 
-# Import AI libraries
-try:
-    from transformers import CLIPTextModel, CLIPTokenizer
-    from diffusers import StableDiffusionPipeline
-    print("✅ All required libraries imported successfully")
-    print(f"🗂️ HF_HOME: {os.environ.get('HF_HOME', 'Not set')}")
-    print(f"🗂️ TRANSFORMERS_CACHE: {os.environ.get('TRANSFORMERS_CACHE', 'Not set')}")
-except ImportError as e:
-    print(f"❌ Failed to import required libraries: {e}")
-    print("Please ensure all dependencies are installed")
-    exit(1)
+MODEL_ID = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
+CACHE_DIR = os.getenv("HF_HOME", "/app/cache")
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+OFFLINE_MODE = os.getenv("HF_HUB_OFFLINE", "0").lower() in {"1", "true", "yes"}
 
-# Check GPU availability
 CUDA_AVAILABLE = torch.cuda.is_available()
-print(f"🔍 CUDA Available: {CUDA_AVAILABLE}")
-
-if CUDA_AVAILABLE:
-    gpu_name = torch.cuda.get_device_name(0)
-    print(f"🎮 GPU: {gpu_name}")
-else:
-    print("💻 Running in CPU mode")
-
-def check_cache_status():
-    """Check cache directory status"""
-    cache_dirs = ["/app/cache", "/root/.cache/huggingface"]
-    
-    for cache_dir in cache_dirs:
-        print(f"📂 Checking {cache_dir}:")
-        if os.path.exists(cache_dir):
-            try:
-                items = os.listdir(cache_dir)
-                print(f"   ✅ Exists with {len(items)} items")
-                if items:
-                    print(f"   📁 Contents: {items[:5]}{'...' if len(items) > 5 else ''}")
-                    
-                    # Calculate cache size
-                    total_size = 0
-                    for root, dirs, files in os.walk(cache_dir):
-                        for file in files:
-                            try:
-                                total_size += os.path.getsize(os.path.join(root, file))
-                            except (OSError, FileNotFoundError):
-                                pass
-                    
-                    if total_size > 0:
-                        size_gb = total_size / (1024**3)
-                        print(f"   📊 Cache size: {size_gb:.2f} GB")
-                else:
-                    print("   📭 Empty directory")
-            except Exception as e:
-                print(f"   ❌ Error reading directory: {e}")
-        else:
-            print("   ❌ Directory does not exist")
-
-# Global pipeline variables
 gpu_pipeline = None
 cpu_pipeline = None
 
-def load_gpu_pipeline():
-    """Load Stable Diffusion pipeline for GPU"""
-    global gpu_pipeline
-    if gpu_pipeline is None and CUDA_AVAILABLE:
-        print("🔄 Loading GPU pipeline...")
-        
-        # Check cache directories
-        cache_dir = "/app/cache"
-        print(f"📂 App cache directory: {cache_dir}")
-        print(f"📂 Cache dir exists: {os.path.exists(cache_dir)}")
-        
-        try:
-            # Clear CUDA cache first
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                print(f"🎮 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB total")
-            
-            print("� Loading model directly to GPU (avoiding slow transfer)...")
-            start_time = time.time()
-            
-            # Load directly to GPU (remove unsupported torch_device parameter)
-            gpu_pipeline = StableDiffusionPipeline.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                torch_dtype=torch.float16,
-                safety_checker=None,
-                requires_safety_checker=False,
-                use_safetensors=True,
-                cache_dir=cache_dir,
-                low_cpu_mem_usage=False,  # Disable to avoid conflicts
-                use_auth_token=False,
-                local_files_only=True   # Force use of cached files only
+
+def cuda_version_tuple():
+    if not torch.version.cuda:
+        return (0, 0)
+    parts = torch.version.cuda.split(".")
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except (IndexError, ValueError):
+        return (0, 0)
+
+
+def log_system_info():
+    """Print useful runtime details for Docker logs."""
+    print("AI Image Generator starting")
+    print(f"Model: {MODEL_ID}")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"PyTorch CUDA runtime: {torch.version.cuda}")
+    print(f"CUDA available: {CUDA_AVAILABLE}")
+    print(f"HF_HOME: {CACHE_DIR}")
+    print(f"Offline model loading: {OFFLINE_MODE}")
+
+    if CUDA_AVAILABLE:
+        for idx in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(idx)
+            capability = torch.cuda.get_device_capability(idx)
+            print(
+                "GPU "
+                f"{idx}: {props.name}, "
+                f"{props.total_memory / 1024**3:.1f} GB, "
+                f"compute capability {capability[0]}.{capability[1]}"
             )
-            
-            # Move pipeline to GPU after loading
-            gpu_pipeline = gpu_pipeline.to("cuda")
-            
-            load_time = time.time() - start_time
-            print(f"✅ Model loaded directly to GPU in {load_time:.1f}s")
-            
-            print("⚡ Enabling optimizations...")
-            # Enable memory-efficient attention
-            gpu_pipeline.enable_attention_slicing()
-            
-            # Try to enable XFormers if available
-            if hasattr(gpu_pipeline, 'enable_xformers_memory_efficient_attention'):
-                try:
-                    gpu_pipeline.enable_xformers_memory_efficient_attention()
-                    print("✅ XFormers enabled")
-                except Exception as e:
-                    print(f"⚠️ XFormers not available: {e}")
-            
-            total_time = time.time() - start_time
-            print(f"✅ GPU pipeline ready in {total_time:.1f}s total")
-            
-            # Check GPU memory usage
-            if torch.cuda.is_available():
-                memory_used = torch.cuda.memory_allocated(0) / 1024**3
-                print(f"🎮 GPU Memory used: {memory_used:.1f}GB")
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Failed to load directly to GPU: {e}")
-            print("🔄 Trying alternative approach...")
-            
-            # Alternative: Load to CPU first, then move quickly
-            try:
-                print("📥 Loading to CPU first...")
-                gpu_pipeline = StableDiffusionPipeline.from_pretrained(
-                    "runwayml/stable-diffusion-v1-5",
-                    torch_dtype=torch.float32,  # Use float32 for CPU
-                    safety_checker=None,
-                    requires_safety_checker=False,
-                    use_safetensors=True,
-                    cache_dir=cache_dir,
-                    low_cpu_mem_usage=True,
-                    use_auth_token=False,
-                    local_files_only=True
+
+            if capability[0] >= 12 and cuda_version_tuple() < (12, 8):
+                print(
+                    "WARNING: This GPU is Blackwell/RTX 50-series class, but "
+                    f"PyTorch reports CUDA {torch.version.cuda}. Use a CUDA 12.8+ "
+                    "or CUDA 13+ PyTorch build for reliable GPU generation."
                 )
-                
-                print("🔄 Converting to half precision and moving to GPU...")
-                # Convert to half precision and move to GPU
-                gpu_pipeline = gpu_pipeline.half().to("cuda")
-                gpu_pipeline.enable_attention_slicing()
-                
-                print("✅ GPU pipeline loaded with alternative method")
-                return True
-                
-            except Exception as e2:
-                print(f"❌ Alternative method failed: {e2}")
-                print("🔄 Final fallback: Allow downloads...")
-                
-                # Final fallback: allow downloads
-                try:
-                    gpu_pipeline = StableDiffusionPipeline.from_pretrained(
-                        "runwayml/stable-diffusion-v1-5",
-                        torch_dtype=torch.float16,
-                        safety_checker=None,
-                        requires_safety_checker=False,
-                        use_safetensors=True,
-                        cache_dir=cache_dir,
-                        low_cpu_mem_usage=True,
-                        use_auth_token=False,
-                        local_files_only=False
-                    )
-                    
-                    gpu_pipeline = gpu_pipeline.to("cuda")
-                    gpu_pipeline.enable_attention_slicing()
-                    
-                    print("✅ GPU pipeline loaded with final fallback")
-                    return True
-                    
-                except Exception as e3:
-                    print(f"❌ Complete failure: {e3}")
-                    import traceback
-                    traceback.print_exc()
-                    gpu_pipeline = None
-                    return False
-    return True
+    else:
+        print("Running without CUDA. GPU generation will fall back to CPU.")
 
-def load_cpu_pipeline():
-    """Load Stable Diffusion pipeline for CPU"""
-    global cpu_pipeline
-    if cpu_pipeline is None:
-        print("🔄 Loading CPU pipeline...")
-        
-        cache_dir = "/app/cache"
-        print(f"📂 CPU Cache directory: {cache_dir}")
-        
+
+def check_cache_status():
+    """Log cache directory status to make first-run downloads obvious."""
+    for cache_dir in {CACHE_DIR, os.getenv("HF_HUB_CACHE", "/app/cache/hub")}:
+        print(f"Checking cache: {cache_dir}")
+        if not os.path.exists(cache_dir):
+            print("  Missing")
+            continue
+
         try:
-            cpu_pipeline = StableDiffusionPipeline.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                torch_dtype=torch.float32,
-                safety_checker=None,
-                requires_safety_checker=False,
-                use_safetensors=True,
-                cache_dir=cache_dir,
-                low_cpu_mem_usage=True,
-                local_files_only=False,  # Allow downloading if not cached
-                resume_download=True     # Resume interrupted downloads
-            )
-            cpu_pipeline = cpu_pipeline.to("cpu")
-            print("✅ CPU pipeline loaded successfully")
-        except Exception as e:
-            print(f"❌ Failed to load CPU pipeline: {e}")
-            import traceback
-            traceback.print_exc()
-            # Clear any partial pipeline
-            cpu_pipeline = None
-            return False
-    return True
+            items = os.listdir(cache_dir)
+            total_size = 0
+            for root, _, files in os.walk(cache_dir):
+                for filename in files:
+                    try:
+                        total_size += os.path.getsize(os.path.join(root, filename))
+                    except OSError:
+                        pass
+            print(f"  Items: {len(items)}")
+            print(f"  Size: {total_size / 1024**3:.2f} GB")
+        except OSError as exc:
+            print(f"  Could not read cache: {exc}")
 
-def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, width, height):
-    """Generate image using selected device"""
-    
-    if not prompt.strip():
-        return None, "❌ Please enter a prompt"
-    
-    start_time = time.time()
-    
-    # Force garbage collection before generation
+
+def clear_memory():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
+
+def build_pipeline(device):
+    """Load Stable Diffusion for the requested device."""
+    is_gpu = device == "cuda"
+    dtype = torch.float16 if is_gpu else torch.float32
+
+    print(f"Loading {MODEL_ID} on {device}")
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=dtype,
+        safety_checker=None,
+        requires_safety_checker=False,
+        use_safetensors=True,
+        cache_dir=CACHE_DIR,
+        token=HF_TOKEN,
+        local_files_only=OFFLINE_MODE,
+    )
+
+    pipeline = pipeline.to(device)
+    pipeline.enable_attention_slicing()
+
+    if is_gpu and hasattr(pipeline, "enable_xformers_memory_efficient_attention"):
+        try:
+            pipeline.enable_xformers_memory_efficient_attention()
+            print("xFormers attention enabled")
+        except Exception as exc:
+            print(f"xFormers attention unavailable, continuing without it: {exc}")
+
+    return pipeline
+
+
+def load_gpu_pipeline():
+    global gpu_pipeline
+    if not CUDA_AVAILABLE:
+        return False
+    if gpu_pipeline is None:
+        clear_memory()
+        try:
+            gpu_pipeline = build_pipeline("cuda")
+            allocated = torch.cuda.memory_allocated(0) / 1024**3
+            print(f"GPU pipeline ready. Allocated memory: {allocated:.2f} GB")
+        except Exception:
+            gpu_pipeline = None
+            raise
+    return True
+
+
+def load_cpu_pipeline():
+    global cpu_pipeline
+    if cpu_pipeline is None:
+        clear_memory()
+        cpu_pipeline = build_pipeline("cpu")
+        print("CPU pipeline ready")
+    return True
+
+
+def generate_with_pipeline(pipeline, prompt, device, steps, guidance, width, height):
+    generator_device = "cuda" if device == "GPU" else "cpu"
+    generator = torch.Generator(device=generator_device).manual_seed(42)
+
+    kwargs = {
+        "prompt": prompt,
+        "num_inference_steps": steps,
+        "guidance_scale": guidance,
+        "height": height,
+        "width": width,
+        "generator": generator,
+    }
+
+    if device == "GPU":
+        with torch.inference_mode(), torch.autocast("cuda"):
+            return pipeline(**kwargs).images[0]
+
+    with torch.inference_mode():
+        return pipeline(**kwargs).images[0]
+
+
+def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, width, height):
+    """Generate an image using the selected device."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return None, "Please enter a prompt."
+
+    width = int(width)
+    height = int(height)
+    if width % 8 != 0 or height % 8 != 0:
+        return None, "Width and height must be divisible by 8."
+
+    start_time = time.time()
+    clear_memory()
+
     try:
         if device_choice == "GPU" and CUDA_AVAILABLE:
-            # Only load pipeline if not already loaded
-            if gpu_pipeline is None:
-                print(f"🎮 Loading GPU pipeline for: {prompt}")
-                if not load_gpu_pipeline():
-                    print("⚠️ GPU pipeline failed, falling back to CPU")
-                    device_choice = "CPU"  # Fallback to CPU
-                else:
-                    print("✅ GPU pipeline ready")
-            else:
-                print("🎮 Using cached GPU pipeline")
-            
-            if gpu_pipeline is not None:
-                print(f"🎮 Generating with GPU: {prompt}")
-                with torch.cuda.amp.autocast():  # Use automatic mixed precision for speed
-                    image = gpu_pipeline(
-                        prompt,
-                        num_inference_steps=num_inference_steps,
-                        guidance_scale=guidance_scale,
-                        height=height,
-                        width=width,
-                        generator=torch.Generator(device="cuda").manual_seed(42)  # Consistent results
-                    ).images[0]
+            try:
+                load_gpu_pipeline()
+                image = generate_with_pipeline(
+                    gpu_pipeline,
+                    prompt,
+                    "GPU",
+                    int(num_inference_steps),
+                    float(guidance_scale),
+                    width,
+                    height,
+                )
                 device_used = "GPU"
-        
-        if device_choice == "CPU" or not CUDA_AVAILABLE:
-            # Only load pipeline if not already loaded
-            if cpu_pipeline is None:
-                print(f"💻 Loading CPU pipeline for: {prompt}")
-                if not load_cpu_pipeline():
-                    return None, "❌ Failed to load CPU pipeline"
-                else:
-                    print("✅ CPU pipeline ready")
-            else:
-                print("💻 Using cached CPU pipeline")
-            
-            print(f"💻 Generating with CPU: {prompt}")
-            image = cpu_pipeline(
+            except torch.cuda.OutOfMemoryError:
+                clear_memory()
+                return (
+                    None,
+                    "GPU ran out of memory. Try 512x512, fewer steps, or CPU mode.",
+                )
+            except Exception as exc:
+                print(f"GPU generation failed: {exc}")
+                if os.getenv("DISABLE_CPU_FALLBACK", "0").lower() in {"1", "true", "yes"}:
+                    raise
+                print("Falling back to CPU generation")
+                load_cpu_pipeline()
+                image = generate_with_pipeline(
+                    cpu_pipeline,
+                    prompt,
+                    "CPU",
+                    int(num_inference_steps),
+                    float(guidance_scale),
+                    width,
+                    height,
+                )
+                device_used = "CPU fallback"
+        else:
+            load_cpu_pipeline()
+            image = generate_with_pipeline(
+                cpu_pipeline,
                 prompt,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                height=height,
-                width=width,
-                generator=torch.Generator().manual_seed(42)  # Consistent results
-            ).images[0]
+                "CPU",
+                int(num_inference_steps),
+                float(guidance_scale),
+                width,
+                height,
+            )
             device_used = "CPU"
-        
-        generation_time = time.time() - start_time
-        status = f"✅ Generated using {device_used} in {generation_time:.1f}s"
-        
-        # Clean up memory after generation
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return image, status
-        
-    except Exception as e:
-        error_time = time.time() - start_time
-        error_msg = f"❌ Generation failed after {error_time:.1f}s: {str(e)}"
-        print(error_msg)
-        return None, error_msg
 
-# Create Gradio interface
+        elapsed = time.time() - start_time
+        clear_memory()
+        return image, f"Generated using {device_used} in {elapsed:.1f}s."
+
+    except Exception as exc:
+        elapsed = time.time() - start_time
+        clear_memory()
+        print(f"Generation failed after {elapsed:.1f}s: {exc}")
+        return None, f"Generation failed after {elapsed:.1f}s: {exc}"
+
+
 def create_interface():
-    """Create the Gradio web interface"""
-    
+    """Create the Gradio web interface."""
     with gr.Blocks(title="AI Image Generator", theme=gr.themes.Soft()) as interface:
-        
-        gr.Markdown("# 🎨 AI Image Generator")
-        gr.Markdown("Generate images using Stable Diffusion with GPU or CPU")
-        
+        gr.Markdown("# AI Image Generator")
+        gr.Markdown("Generate images using Stable Diffusion with GPU or CPU.")
+
         with gr.Row():
             with gr.Column(scale=1):
-                # Input controls
                 prompt_input = gr.Textbox(
-                    label="Prompt", 
+                    label="Prompt",
                     placeholder="Enter your image description...",
-                    lines=3
+                    lines=3,
                 )
-                
+
                 device_choice = gr.Radio(
                     choices=["GPU", "CPU"],
                     value="GPU" if CUDA_AVAILABLE else "CPU",
                     label="Device",
-                    info="GPU is preferred when available"
+                    info="GPU is preferred when available.",
                 )
-                
+
                 with gr.Row():
                     steps_slider = gr.Slider(
                         minimum=10,
                         maximum=50,
                         value=20,
                         step=1,
-                        label="Inference Steps"
+                        label="Inference Steps",
                     )
-                    
+
                     guidance_slider = gr.Slider(
                         minimum=1.0,
                         maximum=20.0,
                         value=7.5,
                         step=0.5,
-                        label="Guidance Scale"
+                        label="Guidance Scale",
                     )
-                
+
                 width_slider = gr.Slider(
                     minimum=256,
-                    maximum=2048,
+                    maximum=1024,
                     value=512,
                     step=64,
-                    label="Width (px)"
+                    label="Width (px)",
                 )
                 height_slider = gr.Slider(
                     minimum=256,
-                    maximum=2048,
+                    maximum=1024,
                     value=512,
                     step=64,
-                    label="Height (px)"
+                    label="Height (px)",
                 )
-                generate_btn = gr.Button("🎨 Generate Image", variant="primary", size="lg")
-                
+                generate_btn = gr.Button("Generate Image", variant="primary", size="lg")
+
             with gr.Column(scale=1):
-                # Output
                 output_image = gr.Image(label="Generated Image", height=512)
                 status_text = gr.Textbox(label="Status", interactive=False)
-        
-        # System info
+
         with gr.Accordion("System Information", open=False):
+            gpu_name = torch.cuda.get_device_name(0) if CUDA_AVAILABLE else "N/A"
+            cuda_runtime = torch.version.cuda or "N/A"
             info_text = f"""
             **GPU Available:** {CUDA_AVAILABLE}
-            **GPU Name:** {torch.cuda.get_device_name(0) if CUDA_AVAILABLE else 'N/A'}
+            **GPU Name:** {gpu_name}
             **PyTorch Version:** {torch.__version__}
-            **Default Device:** {'GPU' if CUDA_AVAILABLE else 'CPU'}
+            **PyTorch CUDA Runtime:** {cuda_runtime}
+            **Model:** {MODEL_ID}
+            **Cache Directory:** {CACHE_DIR}
             """
             gr.Markdown(info_text)
-        
-        # Connect the generate button
+
         generate_btn.click(
             fn=generate_image,
-            inputs=[prompt_input, device_choice, steps_slider, guidance_slider, width_slider, height_slider],
-            outputs=[output_image, status_text]
+            inputs=[
+                prompt_input,
+                device_choice,
+                steps_slider,
+                guidance_slider,
+                width_slider,
+                height_slider,
+            ],
+            outputs=[output_image, status_text],
         )
-    
+
     return interface
 
+
 if __name__ == "__main__":
-    print("🚀 Starting AI Image Generator...")
-    print(f"🔍 Python version: {torch.__version__}")
-    print(f"🔍 CUDA Available: {CUDA_AVAILABLE}")
-    
-    # Check cache status at startup
-    print("\n📊 Cache Status Check:")
+    log_system_info()
     check_cache_status()
-    print()
-    
+    print("Pipelines will be loaded on first use.")
+
     try:
-        # Don't pre-load pipelines - use lazy loading instead
-        print("ℹ️ Pipelines will be loaded on first use (lazy loading)")
-        
-        # Create and launch interface
-        print("🔄 Creating Gradio interface...")
-        interface = create_interface()
-        
-        print("🌐 Launching web interface...")
-        print("📡 Server will be available at:")
-        print("   - Local: http://localhost:7860")
-        print("   - Local (IP): http://127.0.0.1:7860")
-        print("   - Network: http://0.0.0.0:7860")
-        print("💡 If localhost doesn't work, try 127.0.0.1:7860")
-        
-        interface.launch(
+        app = create_interface()
+        app.launch(
             server_name="0.0.0.0",
             server_port=7860,
-            share=False,  # Disable share link for better performance
+            share=False,
             show_error=True,
-            debug=False,  # Disable debug mode for performance
-            inbrowser=False,  # Don't auto-open browser
-            prevent_thread_lock=False  # Ensure server stays running
+            debug=False,
+            inbrowser=False,
+            prevent_thread_lock=False,
         )
-        
-    except Exception as e:
-        print(f"❌ Failed to start application: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+    except Exception as exc:
+        print(f"Failed to start application: {exc}")
+        raise
