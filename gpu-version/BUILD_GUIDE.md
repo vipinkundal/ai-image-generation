@@ -67,6 +67,36 @@ volumes:
 
 Set `HF_HUB_OFFLINE=1` only after the model is already cached.
 
+### Preload The Model Into A Docker Volume
+
+If you run the app with plain `docker run --rm` and no volume, the downloaded
+model is deleted when the container exits. Use a named volume to keep the model
+cache across runs:
+
+```bash
+docker volume create ai-image-model-cache
+docker run --rm -v ai-image-model-cache:/app/cache ai-image-gpu python3 /app/download_model.py
+docker run --gpus all --rm -p 7860:7860 -v ai-image-model-cache:/app/cache ai-image-gpu
+```
+
+The first command downloads the model into the volume. The second command starts
+the app with that same cache mounted, so generation loads local files instead of
+fetching model files from Hugging Face.
+
+### Bake The Model Into The Image
+
+You can also build a self-contained image with the model already downloaded:
+
+```bash
+docker build \
+  --build-arg DOWNLOAD_MODEL=true \
+  --build-arg MODEL_ID=runwayml/stable-diffusion-v1-5 \
+  -t ai-image-gpu .
+```
+
+Do not mount an empty `/app/cache` volume over a baked image cache, because the
+volume hides the files stored in the image layer.
+
 For gated models, set one of:
 
 ```bash
@@ -77,8 +107,31 @@ HUGGING_FACE_HUB_TOKEN=...
 ## Useful Environment Variables
 
 - `MODEL_ID`: override the model, default is `runwayml/stable-diffusion-v1-5`
-- `DISABLE_CPU_FALLBACK=1`: fail instead of falling back to CPU after GPU errors
 - `HF_HUB_OFFLINE=1`: force cached model files only
+- `PRELOAD_GPU=1`: load the GPU pipeline at app startup, default enabled
+- `GPU_MEMORY_PERCENT=80`: default PyTorch GPU memory limit shown in the UI
+- `ENABLE_ATTENTION_SLICING=1`: reduce VRAM use but usually slow generation
+- `ENABLE_TORCH_COMPILE=1`: compile the UNet; first run is slower, repeated
+  same-size generations may become faster
+
+## Speed Notes
+
+The GPU app uses a DPM multistep scheduler by default, so `16-20` steps is a
+good starting range for `512x512`. Higher step counts increase runtime almost
+linearly.
+
+For best speed:
+
+- Use the shared model cache volume so generation does not download files.
+- Keep output size at `512x512` while testing prompts.
+- Leave `ENABLE_ATTENTION_SLICING=0` unless you hit VRAM limits.
+- Try `ENABLE_TORCH_COMPILE=1` only if you generate many images at the same
+  size and can tolerate a slower first generation.
+
+The GPU memory slider limits how much visible VRAM PyTorch may use. It does not
+pre-allocate VRAM and higher values are not automatically faster, but raising it
+can help prevent out-of-memory errors when using larger images or heavier
+settings.
 
 ## Troubleshooting
 

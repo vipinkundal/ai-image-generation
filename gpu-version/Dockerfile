@@ -8,6 +8,9 @@ FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 WORKDIR /app
 
+ARG MODEL_ID=runwayml/stable-diffusion-v1-5
+ARG DOWNLOAD_MODEL=false
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -18,6 +21,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_CACHE=/app/cache/hub \
     HUGGINGFACE_HUB_CACHE=/app/cache/hub \
     HF_HUB_DOWNLOAD_TIMEOUT=600 \
+    MODEL_ID=${MODEL_ID} \
+    PRELOAD_GPU=1 \
+    GPU_MEMORY_PERCENT=80 \
+    ENABLE_ATTENTION_SLICING=0 \
+    ENABLE_TORCH_COMPILE=0 \
     PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True \
     CUDA_LAUNCH_BLOCKING=0 \
     TORCH_CUDNN_V8_API_ENABLED=1
@@ -41,6 +49,9 @@ RUN python3 -m pip install \
 
 COPY requirements-no-torch.txt .
 RUN python3 -m pip install -r requirements-no-torch.txt
+
+COPY download_model.py .
+RUN if [ "$DOWNLOAD_MODEL" = "true" ]; then python3 download_model.py; fi
 
 COPY app.py .
 

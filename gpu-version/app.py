@@ -1,7 +1,7 @@
 """
 Simple AI Image Generator.
 
-GPU is preferred when CUDA is available, with CPU kept as a fallback.
+GPU is preferred when CUDA is available. CPU runs only when explicitly selected.
 """
 
 import gc
@@ -16,17 +16,79 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/app/cache/hub")
 
 import gradio as gr
 import torch
-from diffusers import StableDiffusionPipeline
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
 
 
 MODEL_ID = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
 CACHE_DIR = os.getenv("HF_HOME", "/app/cache")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 OFFLINE_MODE = os.getenv("HF_HUB_OFFLINE", "0").lower() in {"1", "true", "yes"}
+PRELOAD_GPU = os.getenv("PRELOAD_GPU", "1").lower() in {"1", "true", "yes"}
+ENABLE_ATTENTION_SLICING = os.getenv("ENABLE_ATTENTION_SLICING", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+ENABLE_TORCH_COMPILE = os.getenv("ENABLE_TORCH_COMPILE", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+DEFAULT_GPU_MEMORY_PERCENT = int(os.getenv("GPU_MEMORY_PERCENT", "80"))
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 gpu_pipeline = None
 cpu_pipeline = None
+current_gpu_memory_fraction = None
+
+if CUDA_AVAILABLE:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def configure_gpu_memory_limit(percent):
+    """Set the PyTorch CUDA allocator limit for this process."""
+    global current_gpu_memory_fraction
+
+    if not CUDA_AVAILABLE:
+        return "CUDA is not available."
+
+    percent = clamp(int(percent), 40, 100)
+    fraction = percent / 100
+
+    if current_gpu_memory_fraction != fraction:
+        torch.cuda.set_per_process_memory_fraction(fraction, device=0)
+        current_gpu_memory_fraction = fraction
+        clear_memory(release_cuda_cache=True)
+        print(f"GPU memory limit set to {percent}% of visible GPU memory")
+
+    return gpu_memory_status(percent)
+
+
+def gpu_memory_status(limit_percent=None):
+    if not CUDA_AVAILABLE:
+        return "GPU memory: CUDA is not available."
+
+    props = torch.cuda.get_device_properties(0)
+    total = props.total_memory / 1024**3
+    allocated = torch.cuda.memory_allocated(0) / 1024**3
+    reserved = torch.cuda.memory_reserved(0) / 1024**3
+
+    if limit_percent is None:
+        limit_percent = int((current_gpu_memory_fraction or 1.0) * 100)
+
+    limit_gb = total * (int(limit_percent) / 100)
+    return (
+        "GPU memory: "
+        f"{allocated:.2f} GB allocated, "
+        f"{reserved:.2f} GB reserved, "
+        f"{limit_gb:.2f} GB limit ({int(limit_percent)}% of {total:.2f} GB visible)."
+    )
 
 
 def cuda_version_tuple():
@@ -67,7 +129,7 @@ def log_system_info():
                     "or CUDA 13+ PyTorch build for reliable GPU generation."
                 )
     else:
-        print("Running without CUDA. GPU generation will fall back to CPU.")
+        print("Running without CUDA. Select CPU mode or fix GPU access.")
 
 
 def check_cache_status():
@@ -93,9 +155,9 @@ def check_cache_status():
             print(f"  Could not read cache: {exc}")
 
 
-def clear_memory():
+def clear_memory(release_cuda_cache=False):
     gc.collect()
-    if torch.cuda.is_available():
+    if release_cuda_cache and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
@@ -116,8 +178,21 @@ def build_pipeline(device):
         local_files_only=OFFLINE_MODE,
     )
 
+    if is_gpu:
+        pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipeline.scheduler.config,
+            algorithm_type="dpmsolver++",
+            use_karras_sigmas=True,
+        )
+
     pipeline = pipeline.to(device)
-    pipeline.enable_attention_slicing()
+
+    if is_gpu:
+        pipeline.unet.to(memory_format=torch.channels_last)
+
+    if ENABLE_ATTENTION_SLICING:
+        pipeline.enable_attention_slicing()
+        print("Attention slicing enabled")
 
     if is_gpu and hasattr(pipeline, "enable_xformers_memory_efficient_attention"):
         try:
@@ -125,6 +200,10 @@ def build_pipeline(device):
             print("xFormers attention enabled")
         except Exception as exc:
             print(f"xFormers attention unavailable, continuing without it: {exc}")
+
+    if is_gpu and ENABLE_TORCH_COMPILE and hasattr(torch, "compile"):
+        print("Compiling UNet. First generation will be slower; later generations may be faster.")
+        pipeline.unet = torch.compile(pipeline.unet, mode="reduce-overhead", fullgraph=False)
 
     return pipeline
 
@@ -134,7 +213,7 @@ def load_gpu_pipeline():
     if not CUDA_AVAILABLE:
         return False
     if gpu_pipeline is None:
-        clear_memory()
+        clear_memory(release_cuda_cache=True)
         try:
             gpu_pipeline = build_pipeline("cuda")
             allocated = torch.cuda.memory_allocated(0) / 1024**3
@@ -175,7 +254,15 @@ def generate_with_pipeline(pipeline, prompt, device, steps, guidance, width, hei
         return pipeline(**kwargs).images[0]
 
 
-def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, width, height):
+def generate_image(
+    prompt,
+    device_choice,
+    gpu_memory_percent,
+    num_inference_steps,
+    guidance_scale,
+    width,
+    height,
+):
     """Generate an image using the selected device."""
     prompt = (prompt or "").strip()
     if not prompt:
@@ -194,6 +281,7 @@ def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, w
             if not CUDA_AVAILABLE:
                 return None, "GPU was selected, but CUDA is not available in this container."
 
+            memory_status = configure_gpu_memory_limit(gpu_memory_percent)
             load_gpu_pipeline()
             image = generate_with_pipeline(
                 gpu_pipeline,
@@ -206,6 +294,7 @@ def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, w
             )
             device_used = "GPU"
         elif device_choice == "CPU":
+            memory_status = "GPU memory limit is ignored for CPU generation."
             load_cpu_pipeline()
             image = generate_with_pipeline(
                 cpu_pipeline,
@@ -222,21 +311,25 @@ def generate_image(prompt, device_choice, num_inference_steps, guidance_scale, w
 
         elapsed = time.time() - start_time
         clear_memory()
-        return image, f"Generated using {device_used} in {elapsed:.1f}s."
+        if device_used == "GPU":
+            memory_status = gpu_memory_status(gpu_memory_percent)
+        return image, f"Generated using {device_used} in {elapsed:.1f}s.\n{memory_status}"
 
     except torch.cuda.OutOfMemoryError as exc:
         elapsed = time.time() - start_time
-        clear_memory()
+        clear_memory(release_cuda_cache=True)
         detail = (
             f"GPU ran out of memory after {elapsed:.1f}s.\n"
             f"Error: {exc}\n\n"
-            "Try 512x512, fewer steps, or restart the container to clear GPU state."
+            f"{gpu_memory_status(gpu_memory_percent)}\n\n"
+            "Try raising the GPU memory limit, using 512x512, fewer steps, "
+            "or restarting the container to clear GPU state."
         )
         print(detail)
         return None, detail
     except Exception as exc:
         elapsed = time.time() - start_time
-        clear_memory()
+        clear_memory(release_cuda_cache=True)
         details = traceback.format_exc()
         device_label = device_choice if device_choice in {"GPU", "CPU"} else "selected device"
         message = (
@@ -270,11 +363,21 @@ def create_interface():
                     info="GPU is preferred when available.",
                 )
 
+                gpu_memory_slider = gr.Slider(
+                    minimum=40,
+                    maximum=100,
+                    value=clamp(DEFAULT_GPU_MEMORY_PERCENT, 40, 100),
+                    step=5,
+                    label="GPU Memory Limit (%)",
+                    info="Limits how much visible GPU memory this app may use. Higher is not automatically faster.",
+                    interactive=CUDA_AVAILABLE,
+                )
+
                 with gr.Row():
                     steps_slider = gr.Slider(
                         minimum=10,
                         maximum=50,
-                        value=20,
+                        value=16,
                         step=1,
                         label="Inference Steps",
                     )
@@ -317,6 +420,10 @@ def create_interface():
             **PyTorch CUDA Runtime:** {cuda_runtime}
             **Model:** {MODEL_ID}
             **Cache Directory:** {CACHE_DIR}
+            **GPU Preload:** {PRELOAD_GPU}
+            **Attention Slicing:** {ENABLE_ATTENTION_SLICING}
+            **Torch Compile:** {ENABLE_TORCH_COMPILE}
+            **Default GPU Memory Limit:** {clamp(DEFAULT_GPU_MEMORY_PERCENT, 40, 100)}%
             """
             gr.Markdown(info_text)
 
@@ -325,6 +432,7 @@ def create_interface():
             inputs=[
                 prompt_input,
                 device_choice,
+                gpu_memory_slider,
                 steps_slider,
                 guidance_slider,
                 width_slider,
@@ -339,7 +447,13 @@ def create_interface():
 if __name__ == "__main__":
     log_system_info()
     check_cache_status()
-    print("Pipelines will be loaded on first use.")
+    if CUDA_AVAILABLE:
+        configure_gpu_memory_limit(DEFAULT_GPU_MEMORY_PERCENT)
+    if PRELOAD_GPU and CUDA_AVAILABLE:
+        print("Preloading GPU pipeline at startup.")
+        load_gpu_pipeline()
+    else:
+        print("Pipelines will be loaded on first use.")
 
     try:
         app = create_interface()
