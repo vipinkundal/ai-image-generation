@@ -380,6 +380,10 @@ def create_interface():
                         value=16,
                         step=1,
                         label="Inference Steps",
+                        info=(
+                            "How many denoising passes to run. More steps can add detail, "
+                            "but generation gets slower almost linearly."
+                        ),
                     )
 
                     guidance_slider = gr.Slider(
@@ -388,6 +392,10 @@ def create_interface():
                         value=7.5,
                         step=0.5,
                         label="Guidance Scale",
+                        info=(
+                            "How strongly the image follows the prompt. Lower values are more "
+                            "creative; higher values are stricter but can look harsh."
+                        ),
                     )
 
                 width_slider = gr.Slider(
@@ -404,6 +412,18 @@ def create_interface():
                     step=64,
                     label="Height (px)",
                 )
+                with gr.Accordion("Generation Settings", open=False):
+                    gr.Markdown(
+                        """
+                        **Inference Steps:** More steps give the model more chances to refine the image. `16-20` is a good fast range with the DPM scheduler. `30-50` can improve some prompts, but it is much slower.
+
+                        **Guidance Scale:** Controls prompt strength. `5-8` is usually balanced. Lower values allow more variation. Very high values can over-sharpen, distort colors, or create artifacts.
+
+                        **Width / Height:** Larger images need much more VRAM and time. Start with `512x512`, then increase size after the prompt works.
+
+                        **GPU Memory Limit:** Limits how much visible VRAM this app may use. It helps prevent out-of-memory errors, but raising it does not automatically make normal `512x512` generation faster.
+                        """
+                    )
                 generate_btn = gr.Button("Generate Image", variant="primary", size="lg")
 
             with gr.Column(scale=1):
