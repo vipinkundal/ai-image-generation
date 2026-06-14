@@ -52,6 +52,16 @@ dangling images and the previous auto-named container, run:
 ./clean-docker-images.sh
 ```
 
+If you prefer plain `docker run`, use the fixed-name script instead of Docker
+Desktop's image run button:
+
+```bash
+./run-gpu-container.sh
+```
+
+That script always starts image `ai-image-gpu:latest` as container
+`ai-image-gpu`.
+
 Open:
 
 ```text
@@ -98,7 +108,7 @@ cache across runs:
 ```bash
 docker volume create ai-image-model-cache
 docker run --rm -v ai-image-model-cache:/app/cache ai-image-gpu python3 /app/download_model.py
-docker run --gpus all --rm -p 7860:7860 -v ai-image-model-cache:/app/cache ai-image-gpu
+docker run -d --name ai-image-gpu --gpus all -p 7860:7860 -v ai-image-model-cache:/app/cache ai-image-gpu:latest
 ```
 
 The first command downloads the model into the volume. The second command starts
@@ -132,6 +142,9 @@ HUGGING_FACE_HUB_TOKEN=...
 - `HF_HUB_OFFLINE=1`: force cached model files only
 - `PRELOAD_GPU=1`: load the GPU pipeline at app startup, default enabled
 - `GPU_MEMORY_PERCENT=80`: default PyTorch GPU memory limit shown in the UI
+- `MAX_GENERATION_DIMENSION=1024`: largest side used for the actual diffusion
+  pass before upscaling
+- `MAX_OUTPUT_DIMENSION=4096`: largest final output side exposed in the UI
 - `ENABLE_ATTENTION_SLICING=1`: reduce VRAM use but usually slow generation
 - `ENABLE_TORCH_COMPILE=1`: compile the UNet; first run is slower, repeated
   same-size generations may become faster
@@ -155,6 +168,20 @@ pre-allocate VRAM and higher values are not automatically faster, but raising it
 can help prevent out-of-memory errors when using larger images or heavier
 settings.
 
+## 4K Output
+
+The app can output up to `4096px` on either side. For example, use
+`3840x2160` for 4K UHD.
+
+Stable Diffusion v1.5 is not designed to directly generate huge 4K latents.
+Instead, the app generates at a safer internal size, capped by
+`MAX_GENERATION_DIMENSION`, and then upscales the final image to the requested
+output pixels. This keeps GPU memory use realistic while still producing a 4K
+image file.
+
+If you raise `MAX_GENERATION_DIMENSION`, quality may improve for large outputs,
+but runtime and VRAM use increase quickly.
+
 ## Troubleshooting
 
 ### CUDA Not Available In Container
@@ -174,7 +201,9 @@ Start with:
 - `20` inference steps
 - guidance `7.5`
 
-Increase resolution only after the baseline works.
+Increase output resolution only after the baseline works. For 4K output, keep
+`MAX_GENERATION_DIMENSION=1024` first, then raise it only if the GPU has enough
+VRAM.
 
 ### Model Load Fails
 

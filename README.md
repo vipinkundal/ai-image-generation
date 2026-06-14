@@ -24,7 +24,7 @@ image-generation/
 ### GPU Version (Recommended)
 ```bash
 cd gpu-version
-docker-compose up --build
+docker compose up -d --build
 ```
 
 ### CPU Version (Fallback)
@@ -53,7 +53,14 @@ Both versions will be available at:
 ```bash
 cd gpu-version
 docker build -t ai-image-gpu .
-docker run --gpus all --rm -p 7860:7860 ai-image-gpu
+./run-gpu-container.sh
+```
+
+Or run the image manually with a fixed container name:
+
+```bash
+docker rm -f ai-image-gpu 2>/dev/null || true
+docker run -d --name ai-image-gpu --gpus all -p 7860:7860 ai-image-gpu:latest
 ```
 
 ### CPU Version

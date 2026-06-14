@@ -17,6 +17,7 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/app/cache/hub")
 import gradio as gr
 import torch
 from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
+from PIL import Image
 
 
 MODEL_ID = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
@@ -35,6 +36,8 @@ ENABLE_TORCH_COMPILE = os.getenv("ENABLE_TORCH_COMPILE", "0").lower() in {
     "yes",
 }
 DEFAULT_GPU_MEMORY_PERCENT = int(os.getenv("GPU_MEMORY_PERCENT", "80"))
+MAX_GENERATION_DIMENSION = int(os.getenv("MAX_GENERATION_DIMENSION", "1024"))
+MAX_OUTPUT_DIMENSION = int(os.getenv("MAX_OUTPUT_DIMENSION", "4096"))
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 gpu_pipeline = None
@@ -49,6 +52,32 @@ if CUDA_AVAILABLE:
 
 def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
+
+
+def round_down_to_multiple(value, multiple):
+    return max(multiple, int(value) // multiple * multiple)
+
+
+def calculate_generation_size(output_width, output_height):
+    """Pick a diffusion size that preserves aspect ratio and can be upscaled."""
+    max_generation_dimension = clamp(MAX_GENERATION_DIMENSION, 256, MAX_OUTPUT_DIMENSION)
+    largest_output_dimension = max(output_width, output_height)
+
+    if largest_output_dimension <= max_generation_dimension:
+        return output_width, output_height, False
+
+    scale = max_generation_dimension / largest_output_dimension
+    generation_width = round_down_to_multiple(output_width * scale, 8)
+    generation_height = round_down_to_multiple(output_height * scale, 8)
+
+    return generation_width, generation_height, True
+
+
+def upscale_image(image, output_width, output_height):
+    if image.size == (output_width, output_height):
+        return image
+
+    return image.resize((output_width, output_height), resample=Image.Resampling.LANCZOS)
 
 
 def configure_gpu_memory_limit(percent):
@@ -272,6 +301,15 @@ def generate_image(
     height = int(height)
     if width % 8 != 0 or height % 8 != 0:
         return None, "Width and height must be divisible by 8."
+    if width > MAX_OUTPUT_DIMENSION or height > MAX_OUTPUT_DIMENSION:
+        return None, f"Width and height must be {MAX_OUTPUT_DIMENSION}px or smaller."
+
+    generation_width, generation_height, will_upscale = calculate_generation_size(width, height)
+    if generation_width < 256 or generation_height < 256:
+        return None, (
+            "The selected aspect ratio is too wide or too tall for the configured "
+            "generation limit. Try a less extreme width/height ratio."
+        )
 
     start_time = time.time()
     clear_memory()
@@ -289,8 +327,8 @@ def generate_image(
                 "GPU",
                 int(num_inference_steps),
                 float(guidance_scale),
-                width,
-                height,
+                generation_width,
+                generation_height,
             )
             device_used = "GPU"
         elif device_choice == "CPU":
@@ -302,18 +340,22 @@ def generate_image(
                 "CPU",
                 int(num_inference_steps),
                 float(guidance_scale),
-                width,
-                height,
+                generation_width,
+                generation_height,
             )
             device_used = "CPU"
         else:
             return None, f"Unknown device choice: {device_choice}"
 
+        image = upscale_image(image, width, height)
         elapsed = time.time() - start_time
         clear_memory()
         if device_used == "GPU":
             memory_status = gpu_memory_status(gpu_memory_percent)
-        return image, f"Generated using {device_used} in {elapsed:.1f}s.\n{memory_status}"
+        size_status = f"Generated at {generation_width}x{generation_height}."
+        if will_upscale:
+            size_status += f" Upscaled to {width}x{height} output pixels."
+        return image, f"Generated using {device_used} in {elapsed:.1f}s.\n{size_status}\n{memory_status}"
 
     except torch.cuda.OutOfMemoryError as exc:
         elapsed = time.time() - start_time
@@ -322,7 +364,7 @@ def generate_image(
             f"GPU ran out of memory after {elapsed:.1f}s.\n"
             f"Error: {exc}\n\n"
             f"{gpu_memory_status(gpu_memory_percent)}\n\n"
-            "Try raising the GPU memory limit, using 512x512, fewer steps, "
+            "Try raising the GPU memory limit, using a smaller output size, fewer steps, "
             "or restarting the container to clear GPU state."
         )
         print(detail)
@@ -400,26 +442,30 @@ def create_interface():
 
                 width_slider = gr.Slider(
                     minimum=256,
-                    maximum=1024,
+                    maximum=MAX_OUTPUT_DIMENSION,
                     value=512,
                     step=64,
-                    label="Width (px)",
+                    label="Output Width (px)",
+                    info="Final image width. Large values are generated smaller and upscaled.",
                 )
                 height_slider = gr.Slider(
                     minimum=256,
-                    maximum=1024,
+                    maximum=MAX_OUTPUT_DIMENSION,
                     value=512,
                     step=64,
-                    label="Height (px)",
+                    label="Output Height (px)",
+                    info="Final image height. 3840x2160 is 4K UHD.",
                 )
                 with gr.Accordion("Generation Settings", open=False):
                     gr.Markdown(
-                        """
+                        f"""
                         **Inference Steps:** More steps give the model more chances to refine the image. `16-20` is a good fast range with the DPM scheduler. `30-50` can improve some prompts, but it is much slower.
 
                         **Guidance Scale:** Controls prompt strength. `5-8` is usually balanced. Lower values allow more variation. Very high values can over-sharpen, distort colors, or create artifacts.
 
-                        **Width / Height:** Larger images need much more VRAM and time. Start with `512x512`, then increase size after the prompt works.
+                        **Output Width / Height:** Sets the final image pixels. For large sizes, the app generates at a safer internal size and upscales to the requested output. Use `3840x2160` for 4K UHD, or `4096x4096` for a large square image.
+
+                        **Internal Generation Size:** Stable Diffusion v1.5 works best around `512-1024px`. This app caps the largest generated side at `{MAX_GENERATION_DIMENSION}px` by default, then upscales when the requested output is larger.
 
                         **GPU Memory Limit:** Limits how much visible VRAM this app may use. It helps prevent out-of-memory errors, but raising it does not automatically make normal `512x512` generation faster.
                         """
@@ -444,6 +490,8 @@ def create_interface():
             **Attention Slicing:** {ENABLE_ATTENTION_SLICING}
             **Torch Compile:** {ENABLE_TORCH_COMPILE}
             **Default GPU Memory Limit:** {clamp(DEFAULT_GPU_MEMORY_PERCENT, 40, 100)}%
+            **Max Generation Dimension:** {MAX_GENERATION_DIMENSION}px
+            **Max Output Dimension:** {MAX_OUTPUT_DIMENSION}px
             """
             gr.Markdown(info_text)
 
