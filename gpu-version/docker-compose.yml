@@ -1,5 +1,7 @@
 services:
   ai-image-generator-gpu:
+    image: ai-image-gpu:latest
+    container_name: ai-image-gpu
     build:
       context: .
       dockerfile: Dockerfile

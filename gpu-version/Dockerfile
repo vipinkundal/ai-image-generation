@@ -6,6 +6,10 @@
 # PyTorch from source in this project image.
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
+LABEL org.opencontainers.image.title="ai-image-gpu" \
+      org.opencontainers.image.description="GPU Stable Diffusion image generator" \
+      org.opencontainers.image.source="gpu-version"
+
 WORKDIR /app
 
 ARG MODEL_ID=runwayml/stable-diffusion-v1-5

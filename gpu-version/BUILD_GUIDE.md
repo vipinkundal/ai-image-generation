@@ -26,8 +26,30 @@ the app image.
 
 ```bash
 cd gpu-version
-docker compose build --no-cache
-docker compose up
+docker compose up -d --build
+```
+
+The Compose file uses stable names:
+
+- Image: `ai-image-gpu:latest`
+- Container: `ai-image-gpu`
+
+If you already have the old auto-named container, remove it once before using
+the stable name:
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+Normal rebuilds will reuse Docker's build cache. Avoid `--no-cache` unless you
+are intentionally rebuilding every dependency layer.
+
+Docker keeps old untagged image IDs after rebuilds. To remove this app's old
+dangling images and the previous auto-named container, run:
+
+```bash
+./clean-docker-images.sh
 ```
 
 Open:
