@@ -186,6 +186,15 @@ The GPU app uses a DPM multistep scheduler by default, so `16-20` steps is a
 good starting range for `512x512`. Higher step counts increase runtime almost
 linearly.
 
+The first generation after starting the container can be much slower than later
+prompts because it may include model download, cache verification, and loading
+the model into GPU memory. The status panel separates model load/cache time from
+diffusion generation time so you can tell where the delay is happening.
+
+SDXL at `1024x1024` is substantially heavier than SD 1.5 at `512x512`. Use SDXL
+for better quality, but test prompts at fewer steps or smaller sizes when you
+are iterating quickly.
+
 For best speed:
 
 - Use the shared model cache volume so generation does not download files.
@@ -240,6 +249,13 @@ VRAM.
 
 Check network access and the Hugging Face cache volume. If the cache is empty
 and `HF_HUB_OFFLINE=1` is set, model loading will fail.
+
+### Blank Or Black SDXL Output
+
+If Docker logs show `invalid value encountered in cast` from Diffusers image
+processing, the model likely produced NaN values during image decode. The GPU app
+keeps the SDXL VAE decode path in float32 to avoid this. Rebuild the image after
+pulling this code change.
 
 ### Optional Acceleration Packages
 

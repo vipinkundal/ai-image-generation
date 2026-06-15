@@ -6,6 +6,7 @@ GPU is preferred when CUDA is available. CPU runs only when explicitly selected.
 
 import gc
 import os
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -18,7 +19,7 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/app/cache/hub")
 import gradio as gr
 import torch
 from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline, StableDiffusionXLPipeline
-from PIL import Image
+from PIL import Image, ImageDraw, ImageStat
 
 
 MODEL_ID = os.getenv("MODEL_ID", "stable-diffusion-v1-5/stable-diffusion-v1-5")
@@ -138,6 +139,40 @@ def upscale_image(image, output_width, output_height):
         return image
 
     return image.resize((output_width, output_height), resample=Image.Resampling.LANCZOS)
+
+
+def format_seconds(seconds):
+    seconds = int(max(0, seconds))
+    minutes, seconds = divmod(seconds, 60)
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def progress_image(title, lines, width=1024, height=1024):
+    image = Image.new("RGB", (width, height), color=(18, 29, 44))
+    draw = ImageDraw.Draw(image)
+    accent = (99, 91, 255)
+    text = (238, 244, 255)
+    muted = (180, 194, 214)
+
+    draw.rectangle((0, 0, width, 90), fill=(31, 45, 65))
+    draw.rectangle((40, 26, 54, 64), fill=accent)
+    draw.text((72, 30), title, fill=text)
+
+    y = 140
+    for index, line in enumerate(lines):
+        fill = text if index == 0 else muted
+        draw.text((60, y), str(line), fill=fill)
+        y += 34
+
+    return image
+
+
+def image_looks_blank(image):
+    grayscale = image.convert("L")
+    stat = ImageStat.Stat(grayscale)
+    return stat.mean[0] < 3 and stat.extrema[0][1] < 12
 
 
 def configure_gpu_memory_limit(percent):
@@ -450,7 +485,7 @@ def build_pipeline(model_choice, device):
     print(f"Loading {config['model_id']} ({pipeline_type}) on {device}")
     load_kwargs = {
         "pretrained_model_name_or_path": config["model_id"],
-        "torch_dtype": dtype,
+        "dtype": dtype,
         "use_safetensors": True,
         "cache_dir": CACHE_DIR,
         "token": HF_TOKEN,
@@ -474,6 +509,11 @@ def build_pipeline(model_choice, device):
         )
 
     pipeline = pipeline.to(device)
+
+    if is_gpu and pipeline_type == "sdxl" and hasattr(pipeline, "vae"):
+        pipeline.vae.to(dtype=torch.float32)
+        pipeline.vae.config.force_upcast = True
+        print("SDXL VAE decode set to float32 to avoid blank/NaN images")
 
     if is_gpu and hasattr(pipeline, "unet"):
         pipeline.unet.to(memory_format=torch.channels_last)
@@ -536,9 +576,24 @@ def load_cpu_pipeline(model_choice):
     return True
 
 
-def generate_with_pipeline(pipeline, prompt, device, steps, guidance, width, height):
+def generate_with_pipeline(
+    pipeline,
+    prompt,
+    device,
+    steps,
+    guidance,
+    width,
+    height,
+    progress_state=None,
+):
     generator_device = "cuda" if device == "GPU" else "cpu"
     generator = torch.Generator(device=generator_device).manual_seed(42)
+
+    def update_progress(_, step, timestep, callback_kwargs):
+        if progress_state is not None:
+            progress_state["step"] = int(step) + 1
+            progress_state["timestep"] = int(timestep) if hasattr(timestep, "item") else timestep
+        return callback_kwargs
 
     kwargs = {
         "prompt": prompt,
@@ -548,13 +603,55 @@ def generate_with_pipeline(pipeline, prompt, device, steps, guidance, width, hei
         "width": width,
         "generator": generator,
     }
+    if progress_state is not None:
+        kwargs.update(
+            {
+                "callback_on_step_end": update_progress,
+                "callback_on_step_end_tensor_inputs": ["latents"],
+            }
+        )
 
-    if device == "GPU":
-        with torch.inference_mode(), torch.autocast("cuda"):
+    try:
+        if device == "GPU":
+            with torch.inference_mode():
+                return pipeline(**kwargs).images[0]
+
+        with torch.inference_mode():
+            return pipeline(**kwargs).images[0]
+    except TypeError as exc:
+        if "callback_on_step_end" not in str(exc):
+            raise
+
+        kwargs.pop("callback_on_step_end", None)
+        kwargs.pop("callback_on_step_end_tensor_inputs", None)
+        if progress_state is not None:
+            progress_state["callback_supported"] = False
+
+        if device == "GPU":
+            with torch.inference_mode():
+                return pipeline(**kwargs).images[0]
+
+        with torch.inference_mode():
             return pipeline(**kwargs).images[0]
 
-    with torch.inference_mode():
-        return pipeline(**kwargs).images[0]
+
+def run_generation_job(job, pipeline, prompt, device, steps, guidance, width, height, progress_state):
+    try:
+        job["image"] = generate_with_pipeline(
+            pipeline,
+            prompt,
+            device,
+            steps,
+            guidance,
+            width,
+            height,
+            progress_state=progress_state,
+        )
+    except Exception as exc:
+        job["error"] = exc
+        job["traceback"] = traceback.format_exc()
+    finally:
+        job["done"] = True
 
 
 def generate_image(
@@ -573,65 +670,176 @@ def generate_image(
 
     prompt = (prompt or "").strip()
     if not prompt:
-        return None, "Please enter a prompt."
+        yield None, "Please enter a prompt."
+        return
 
     try:
         selected_config = model_config(model_choice)
     except ValueError as exc:
-        return None, str(exc)
+        yield None, str(exc)
+        return
 
     width = int(width)
     height = int(height)
     if width % 8 != 0 or height % 8 != 0:
-        return None, "Width and height must be divisible by 8."
+        yield None, "Width and height must be divisible by 8."
+        return
     if width > MAX_OUTPUT_DIMENSION or height > MAX_OUTPUT_DIMENSION:
-        return None, f"Width and height must be {MAX_OUTPUT_DIMENSION}px or smaller."
+        yield None, f"Width and height must be {MAX_OUTPUT_DIMENSION}px or smaller."
+        return
 
     generation_width, generation_height, will_upscale = calculate_generation_size(width, height)
     if generation_width < 256 or generation_height < 256:
-        return None, (
+        yield None, (
             "The selected aspect ratio is too wide or too tall for the configured "
             "generation limit. Try a less extreme width/height ratio."
         )
+        return
 
-    start_time = time.time()
+    total_start_time = time.time()
     clear_memory()
 
     try:
         if device_choice == "GPU":
             if not CUDA_AVAILABLE:
-                return None, "GPU was selected, but CUDA is not available in this container."
+                yield None, "GPU was selected, but CUDA is not available in this container."
+                return
 
-            memory_status = configure_gpu_memory_limit(gpu_memory_percent)
-            load_gpu_pipeline(model_choice)
-            image = generate_with_pipeline(
-                gpu_pipeline,
-                prompt,
-                "GPU",
-                int(num_inference_steps),
-                float(guidance_scale),
+            yield progress_image(
+                "Preparing GPU Generation",
+                [
+                    f"Model: {selected_config['model_id']}",
+                    f"Output: {width}x{height}",
+                    f"Internal generation: {generation_width}x{generation_height}",
+                    "Checking GPU memory and preparing the pipeline...",
+                ],
                 generation_width,
                 generation_height,
+            ), "Checking GPU memory and preparing the pipeline..."
+            memory_status = configure_gpu_memory_limit(gpu_memory_percent)
+            pipeline_was_loaded = gpu_pipeline is not None and gpu_pipeline_choice == model_choice
+            load_start_time = time.time()
+            load_message = (
+                "Reusing model already loaded in GPU memory."
+                if pipeline_was_loaded
+                else "Loading model into GPU memory. First run may also download cached files."
             )
+            yield progress_image(
+                "Loading Model",
+                [
+                    f"Model: {selected_config['model_id']}",
+                    load_message,
+                    "This is usually the slowest part on the first run.",
+                    memory_status,
+                ],
+                generation_width,
+                generation_height,
+            ), load_message
+            load_gpu_pipeline(model_choice)
+            load_elapsed = time.time() - load_start_time
+            pipeline = gpu_pipeline
             device_used = "GPU"
         elif device_choice == "CPU":
             memory_status = "GPU memory limit is ignored for CPU generation."
+            yield progress_image(
+                "Preparing CPU Generation",
+                [
+                    f"Model: {selected_config['model_id']}",
+                    "CPU mode uses system RAM, not VRAM.",
+                    "This can be much slower than GPU generation.",
+                    f"Internal generation: {generation_width}x{generation_height}",
+                ],
+                generation_width,
+                generation_height,
+            ), "Preparing CPU generation..."
+            pipeline_was_loaded = cpu_pipeline is not None and cpu_pipeline_choice == model_choice
+            load_start_time = time.time()
+            load_message = (
+                "Reusing model already loaded in system RAM."
+                if pipeline_was_loaded
+                else "Loading model into system RAM. First run may also download cached files."
+            )
+            yield progress_image(
+                "Loading Model",
+                [
+                    f"Model: {selected_config['model_id']}",
+                    load_message,
+                    "CPU generation can take a long time.",
+                    memory_status,
+                ],
+                generation_width,
+                generation_height,
+            ), load_message
             load_cpu_pipeline(model_choice)
-            image = generate_with_pipeline(
-                cpu_pipeline,
+            load_elapsed = time.time() - load_start_time
+            pipeline = cpu_pipeline
+            device_used = "CPU"
+        else:
+            yield None, f"Unknown device choice: {device_choice}"
+            return
+
+        generation_start_time = time.time()
+        steps = int(num_inference_steps)
+        progress_state = {
+            "step": 0,
+            "total": steps,
+            "callback_supported": True,
+        }
+        job = {"done": False, "image": None, "error": None, "traceback": None}
+        thread = threading.Thread(
+            target=run_generation_job,
+            args=(
+                job,
+                pipeline,
                 prompt,
-                "CPU",
-                int(num_inference_steps),
+                device_used,
+                steps,
                 float(guidance_scale),
                 generation_width,
                 generation_height,
+                progress_state,
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+        while not job["done"]:
+            generation_elapsed = time.time() - generation_start_time
+            step = progress_state["step"]
+            if step:
+                detail = f"Diffusion step {step}/{steps}."
+            elif progress_state["callback_supported"]:
+                detail = "Generation is running. Waiting for the first diffusion step..."
+            else:
+                detail = "Generation is running. This pipeline does not expose step progress."
+
+            yield progress_image(
+                "Generating Image",
+                [
+                    detail,
+                    f"Elapsed generation time: {format_seconds(generation_elapsed)}",
+                    f"Load time before generation: {format_seconds(load_elapsed)}",
+                    f"Internal generation: {generation_width}x{generation_height}",
+                    f"Prompt: {prompt[:90]}",
+                ],
+                generation_width,
+                generation_height,
+            ), (
+                f"{detail}\n"
+                f"Generation elapsed: {format_seconds(generation_elapsed)}\n"
+                f"Model load/cache time: {format_seconds(load_elapsed)}"
             )
-            device_used = "CPU"
-        else:
-            return None, f"Unknown device choice: {device_choice}"
+            time.sleep(1)
+
+        thread.join()
+        if job["error"] is not None:
+            raise job["error"]
+
+        image = job["image"]
 
         image = upscale_image(image, width, height)
-        elapsed = time.time() - start_time
+        total_elapsed = time.time() - total_start_time
+        generation_elapsed = time.time() - generation_start_time
         clear_memory()
         if device_used == "GPU":
             memory_status = gpu_memory_status(gpu_memory_percent)
@@ -639,16 +847,25 @@ def generate_image(
         if will_upscale:
             size_status += f" Upscaled to {width}x{height} output pixels."
         offline_status = "Offline model loading: on." if OFFLINE_MODE else "Offline model loading: off."
-        return image, (
-            f"Generated using {device_used} in {elapsed:.1f}s.\n"
+        blank_warning = ""
+        if image_looks_blank(image):
+            blank_warning = (
+                "\nWarning: the returned image appears almost blank. "
+                "Try a different prompt, fewer steps, lower guidance, or restart the container if this repeats."
+            )
+        yield image, (
+            f"Generated using {device_used} in {total_elapsed:.1f}s.\n"
             f"Model: {selected_config['model_id']} ({selected_config['pipeline_type']}).\n"
+            f"Model load/cache time: {load_elapsed:.1f}s.\n"
+            f"Diffusion generation time: {generation_elapsed:.1f}s.\n"
             f"{size_status}\n"
             f"{memory_status}\n"
             f"{offline_status}"
+            f"{blank_warning}"
         )
 
     except torch.cuda.OutOfMemoryError as exc:
-        elapsed = time.time() - start_time
+        elapsed = time.time() - total_start_time
         clear_memory(release_cuda_cache=True)
         detail = (
             f"GPU ran out of memory after {elapsed:.1f}s.\n"
@@ -658,11 +875,11 @@ def generate_image(
             "or restarting the container to clear GPU state."
         )
         print(detail)
-        return None, detail
+        yield progress_image("GPU Out Of Memory", detail.splitlines(), generation_width, generation_height), detail
     except Exception as exc:
-        elapsed = time.time() - start_time
+        elapsed = time.time() - total_start_time
         clear_memory(release_cuda_cache=True)
-        details = traceback.format_exc()
+        details = job.get("traceback") if "job" in locals() and job.get("traceback") else traceback.format_exc()
         device_label = device_choice if device_choice in {"GPU", "CPU"} else "selected device"
         message = (
             f"{device_label} generation failed after {elapsed:.1f}s.\n"
@@ -671,7 +888,7 @@ def generate_image(
             f"Details:\n{details}"
         )
         print(message)
-        return None, message
+        yield progress_image("Generation Failed", message.splitlines()[:8], generation_width, generation_height), message
 
 
 def create_interface():
