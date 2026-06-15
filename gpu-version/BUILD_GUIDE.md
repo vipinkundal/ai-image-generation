@@ -100,6 +100,31 @@ volumes:
 Use the **Offline Mode** checkbox in the web interface, or set
 `HF_HUB_OFFLINE=1`, only after the model is already cached.
 
+## Runtime Model Selection
+
+The web interface can inspect the visible GPU, show available VRAM, and recommend
+the best supported model for the configured GPU memory limit. Supported runtime
+choices are loaded on demand and cached in the existing Docker volumes.
+
+Changing between supported models in the UI does **not** rebuild the Docker
+image. The first generation with a new model downloads that model into the cache
+volume; later runs reuse the cached files.
+
+Rebuild the Docker image only when app code or Python dependencies change:
+
+```bash
+docker compose up -d --build
+```
+
+Current built-in runtime choices:
+
+- `stabilityai/stable-diffusion-xl-base-1.0`: recommended quality upgrade for
+  GPUs with around 12 GB or more usable VRAM.
+- `stable-diffusion-v1-5/stable-diffusion-v1-5`: legacy, fast, low-VRAM option.
+
+Newer model families such as FLUX.2 or Z-Image need separate pipeline and
+dependency support before they can be added safely to this app image.
+
 ### Preload The Model Into A Docker Volume
 
 If you run the app with plain `docker run --rm` and no volume, the downloaded
@@ -123,7 +148,7 @@ You can also build a self-contained image with the model already downloaded:
 ```bash
 docker build \
   --build-arg DOWNLOAD_MODEL=true \
-  --build-arg MODEL_ID=runwayml/stable-diffusion-v1-5 \
+  --build-arg MODEL_ID=stable-diffusion-v1-5/stable-diffusion-v1-5 \
   -t ai-image-gpu .
 ```
 
@@ -139,7 +164,11 @@ HUGGING_FACE_HUB_TOKEN=...
 
 ## Useful Environment Variables
 
-- `MODEL_ID`: override the model, default is `runwayml/stable-diffusion-v1-5`
+- `MODEL_ID`: override the model, default is
+  `stable-diffusion-v1-5/stable-diffusion-v1-5`
+- `MODEL_PIPELINE_TYPE`: pipeline type for a custom `MODEL_ID`; supported
+  values are `sd15` and `sdxl`
+- `DEFAULT_MODEL_CHOICE`: optional UI model label to select by default
 - `HF_HUB_OFFLINE=1`: force cached model files only
 - `PRELOAD_GPU=1`: load the GPU pipeline at app startup, default disabled so
   the UI offline switch can be selected before model loading

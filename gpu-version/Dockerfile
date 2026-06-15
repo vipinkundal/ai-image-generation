@@ -12,7 +12,7 @@ LABEL org.opencontainers.image.title="ai-image-gpu" \
 
 WORKDIR /app
 
-ARG MODEL_ID=runwayml/stable-diffusion-v1-5
+ARG MODEL_ID=stable-diffusion-v1-5/stable-diffusion-v1-5
 ARG DOWNLOAD_MODEL=false
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

@@ -5,7 +5,7 @@ import os
 from huggingface_hub import snapshot_download
 
 
-MODEL_ID = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
+MODEL_ID = os.getenv("MODEL_ID", "stable-diffusion-v1-5/stable-diffusion-v1-5")
 CACHE_DIR = os.getenv("HF_HOME", "/app/cache")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 

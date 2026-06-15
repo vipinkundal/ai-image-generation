@@ -54,7 +54,8 @@ docker compose run --rm ai-image-generator-gpu /app/verify-system.sh
 
 ## Model And Cache Behavior
 
-The default model is `runwayml/stable-diffusion-v1-5`. Override it with:
+The default SD 1.5 model is `stable-diffusion-v1-5/stable-diffusion-v1-5`.
+Override it with:
 
 ```bash
 MODEL_ID=some/model-id docker compose up

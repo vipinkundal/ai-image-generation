@@ -8,6 +8,7 @@ import gc
 import os
 import time
 import traceback
+from collections import OrderedDict
 
 # Set Hugging Face cache directories before importing diffusers/transformers.
 os.environ.setdefault("HF_HOME", "/app/cache")
@@ -16,11 +17,12 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/app/cache/hub")
 
 import gradio as gr
 import torch
-from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline, StableDiffusionXLPipeline
 from PIL import Image
 
 
-MODEL_ID = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
+MODEL_ID = os.getenv("MODEL_ID", "stable-diffusion-v1-5/stable-diffusion-v1-5")
+MODEL_PIPELINE_TYPE = os.getenv("MODEL_PIPELINE_TYPE", "sd15").lower()
 CACHE_DIR = os.getenv("HF_HOME", "/app/cache")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 OFFLINE_MODE = os.getenv("HF_HUB_OFFLINE", "0").lower() in {"1", "true", "yes"}
@@ -42,7 +44,65 @@ MAX_OUTPUT_DIMENSION = int(os.getenv("MAX_OUTPUT_DIMENSION", "4096"))
 CUDA_AVAILABLE = torch.cuda.is_available()
 gpu_pipeline = None
 cpu_pipeline = None
+gpu_pipeline_choice = None
+cpu_pipeline_choice = None
 current_gpu_memory_fraction = None
+
+MODEL_OPTIONS = OrderedDict(
+    [
+        (
+            "SDXL Base 1.0 (recommended for 16 GB)",
+            {
+                "model_id": "stabilityai/stable-diffusion-xl-base-1.0",
+                "pipeline_type": "sdxl",
+                "min_vram_gb": 10,
+                "recommended_vram_gb": 12,
+                "default_steps": 24,
+                "default_guidance": 6.5,
+                "default_size": 1024,
+                "description": "Better quality than SD 1.5, native 1024px generation.",
+            },
+        ),
+        (
+            "Stable Diffusion 1.5 (legacy, low VRAM)",
+            {
+                "model_id": "stable-diffusion-v1-5/stable-diffusion-v1-5",
+                "pipeline_type": "sd15",
+                "min_vram_gb": 4,
+                "recommended_vram_gb": 6,
+                "default_steps": 20,
+                "default_guidance": 7.5,
+                "default_size": 512,
+                "description": "Older model, fastest and lightest option.",
+            },
+        ),
+    ]
+)
+
+if MODEL_ID not in {option["model_id"] for option in MODEL_OPTIONS.values()}:
+    MODEL_OPTIONS[f"Configured MODEL_ID ({MODEL_PIPELINE_TYPE})"] = {
+        "model_id": MODEL_ID,
+        "pipeline_type": MODEL_PIPELINE_TYPE,
+        "min_vram_gb": 4 if MODEL_PIPELINE_TYPE == "sd15" else 10,
+        "recommended_vram_gb": 6 if MODEL_PIPELINE_TYPE == "sd15" else 12,
+        "default_steps": 20,
+        "default_guidance": 7.5,
+        "default_size": 512,
+        "description": "Custom model from MODEL_ID. Set MODEL_PIPELINE_TYPE=sd15 or sdxl.",
+    }
+
+SUPPORTED_PIPELINES = {
+    "sd15": StableDiffusionPipeline,
+    "sdxl": StableDiffusionXLPipeline,
+}
+
+DEFAULT_MODEL_CHOICE = os.getenv("DEFAULT_MODEL_CHOICE")
+if DEFAULT_MODEL_CHOICE not in MODEL_OPTIONS:
+    DEFAULT_MODEL_CHOICE = (
+        "SDXL Base 1.0 (recommended for 16 GB)"
+        if CUDA_AVAILABLE
+        else "Stable Diffusion 1.5 (legacy, low VRAM)"
+    )
 
 if CUDA_AVAILABLE:
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -120,6 +180,167 @@ def gpu_memory_status(limit_percent=None):
     )
 
 
+def gpu_inventory_status(limit_percent=None):
+    if not CUDA_AVAILABLE:
+        return "GPU: CUDA is not available in this container."
+
+    if limit_percent is None:
+        limit_percent = int((current_gpu_memory_fraction or 1.0) * 100)
+    limit_percent = clamp(int(limit_percent), 40, 100)
+
+    lines = ["Detected GPU configuration:"]
+    for idx in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(idx)
+        total_gb = props.total_memory / 1024**3
+        if idx == torch.cuda.current_device():
+            free_bytes, total_bytes = torch.cuda.mem_get_info(idx)
+            free_gb = free_bytes / 1024**3
+            total_gb = total_bytes / 1024**3
+            free_detail = f", {free_gb:.2f} GB currently free"
+        else:
+            free_detail = ""
+        limit_gb = total_gb * (limit_percent / 100)
+        capability = ".".join(map(str, torch.cuda.get_device_capability(idx)))
+        lines.append(
+            f"- GPU {idx}: {props.name}, {total_gb:.2f} GB visible VRAM"
+            f"{free_detail}, app limit {limit_gb:.2f} GB ({limit_percent}%), sm_{capability.replace('.', '_')}"
+        )
+    return "\n".join(lines)
+
+
+def model_config(model_choice):
+    try:
+        return MODEL_OPTIONS[model_choice]
+    except KeyError as exc:
+        raise ValueError(f"Unknown model choice: {model_choice}") from exc
+
+
+def preferred_model_for_vram(limit_vram_gb):
+    supported = [
+        (choice, config)
+        for choice, config in MODEL_OPTIONS.items()
+        if config["pipeline_type"] in SUPPORTED_PIPELINES
+        and limit_vram_gb >= config["min_vram_gb"]
+    ]
+    if not supported:
+        return "Stable Diffusion 1.5 (legacy, low VRAM)"
+
+    recommended = [
+        (choice, config)
+        for choice, config in supported
+        if limit_vram_gb >= config["recommended_vram_gb"]
+    ]
+    return (recommended or supported)[0][0]
+
+
+def describe_model_options(device_choice, gpu_memory_percent):
+    if device_choice != "GPU":
+        preferred_choice = "Stable Diffusion 1.5 (legacy, low VRAM)"
+        return (
+            gr.update(
+                label="CPU And Model Recommendations",
+                value=(
+                    "CPU selected. VRAM is not used in CPU mode, so GPU memory "
+                    "availability does not apply.\n\n"
+                    "Generation will use system RAM and will be much slower. "
+                    "Use Stable Diffusion 1.5 for CPU tests."
+                ),
+            ),
+            gr.update(value=preferred_choice),
+            gr.update(interactive=False),
+            gr.update(value=selected_model_status(preferred_choice)),
+        )
+
+    if not CUDA_AVAILABLE:
+        preferred_choice = "Stable Diffusion 1.5 (legacy, low VRAM)"
+        return (
+            gr.update(
+                label="GPU And Model Recommendations",
+                value=(
+                    "GPU selected, but CUDA is not available in this container. "
+                    "Check Docker GPU access."
+                ),
+            ),
+            gr.update(value=preferred_choice),
+            gr.update(interactive=False),
+            gr.update(value=selected_model_status(preferred_choice)),
+        )
+
+    gpu_memory_percent = clamp(int(gpu_memory_percent), 40, 100)
+    props = torch.cuda.get_device_properties(0)
+    visible_vram_gb = props.total_memory / 1024**3
+    limit_vram_gb = visible_vram_gb * (gpu_memory_percent / 100)
+    preferred_choice = preferred_model_for_vram(limit_vram_gb)
+
+    lines = [
+        gpu_inventory_status(gpu_memory_percent),
+        "",
+        "Supported runtime model choices:",
+    ]
+    for choice, config in MODEL_OPTIONS.items():
+        if config["pipeline_type"] not in SUPPORTED_PIPELINES:
+            continue
+
+        if limit_vram_gb >= config["recommended_vram_gb"]:
+            status = "recommended"
+        elif limit_vram_gb >= config["min_vram_gb"]:
+            status = "available, but keep sizes conservative"
+        else:
+            status = "not recommended for this VRAM limit"
+
+        marker = " *" if choice == preferred_choice else ""
+        lines.append(
+            f"- {choice}{marker}: {status}. "
+            f"{config['description']} Model: {config['model_id']}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "Newer 16 GB candidates not bundled in this app yet:",
+            "- FLUX.2 [klein] 4B: likely suitable for 16 GB, but needs a newer pipeline/dependency path.",
+            "- Z-Image-Turbo: model card targets 16 GB, but needs newer Diffusers support than this image currently pins.",
+            "",
+            "Selecting a supported model downloads it into the cache volume on first use. "
+            "A Docker rebuild is only needed after app code or dependency changes.",
+        ]
+    )
+    return (
+        gr.update(label="GPU And Model Recommendations", value="\n".join(lines)),
+        gr.update(value=preferred_choice),
+        gr.update(interactive=True),
+        gr.update(value=selected_model_status(preferred_choice)),
+    )
+
+
+def initial_model_recommendation_text(device_choice, gpu_memory_percent):
+    recommendation_update = describe_model_options(device_choice, gpu_memory_percent)[0]
+    if isinstance(recommendation_update, dict):
+        return recommendation_update.get("value", "")
+    return str(recommendation_update)
+
+
+def selected_model_status(model_choice):
+    config = model_config(model_choice)
+    return (
+        f"Selected model: {config['model_id']}\n"
+        f"Pipeline: {config['pipeline_type']}\n"
+        f"{config['description']}"
+    )
+
+
+def model_generation_defaults(model_choice):
+    config = model_config(model_choice)
+    size = min(config["default_size"], MAX_OUTPUT_DIMENSION)
+    return (
+        selected_model_status(model_choice),
+        gr.update(value=config["default_steps"]),
+        gr.update(value=config["default_guidance"]),
+        gr.update(value=size),
+        gr.update(value=size),
+    )
+
+
 def cuda_version_tuple():
     if not torch.version.cuda:
         return (0, 0)
@@ -133,7 +354,8 @@ def cuda_version_tuple():
 def log_system_info():
     """Print useful runtime details for Docker logs."""
     print("AI Image Generator starting")
-    print(f"Model: {MODEL_ID}")
+    print(f"Configured MODEL_ID: {MODEL_ID}")
+    print(f"Default model choice: {DEFAULT_MODEL_CHOICE}")
     print(f"PyTorch: {torch.__version__}")
     print(f"PyTorch CUDA runtime: {torch.version.cuda}")
     print(f"CUDA available: {CUDA_AVAILABLE}")
@@ -192,7 +414,7 @@ def clear_memory(release_cuda_cache=False):
 
 def set_offline_mode(enabled):
     """Switch Hugging Face model loading between online and cached-only modes."""
-    global OFFLINE_MODE, gpu_pipeline, cpu_pipeline
+    global OFFLINE_MODE, gpu_pipeline, cpu_pipeline, gpu_pipeline_choice, cpu_pipeline_choice
 
     enabled = bool(enabled)
     if OFFLINE_MODE == enabled:
@@ -206,27 +428,45 @@ def set_offline_mode(enabled):
         print("Offline mode changed. Unloading pipelines so the next load uses the selected mode.")
         gpu_pipeline = None
         cpu_pipeline = None
+        gpu_pipeline_choice = None
+        cpu_pipeline_choice = None
         clear_memory(release_cuda_cache=True)
 
 
-def build_pipeline(device):
+def build_pipeline(model_choice, device):
     """Load Stable Diffusion for the requested device."""
+    config = model_config(model_choice)
+    pipeline_type = config["pipeline_type"]
+    pipeline_class = SUPPORTED_PIPELINES.get(pipeline_type)
+    if pipeline_class is None:
+        raise ValueError(
+            f"Pipeline type '{pipeline_type}' is not supported by this app image. "
+            "Supported types: sd15, sdxl."
+        )
+
     is_gpu = device == "cuda"
     dtype = torch.float16 if is_gpu else torch.float32
 
-    print(f"Loading {MODEL_ID} on {device}")
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        MODEL_ID,
-        dtype=dtype,
-        safety_checker=None,
-        requires_safety_checker=False,
-        use_safetensors=True,
-        cache_dir=CACHE_DIR,
-        token=HF_TOKEN,
-        local_files_only=OFFLINE_MODE,
-    )
+    print(f"Loading {config['model_id']} ({pipeline_type}) on {device}")
+    load_kwargs = {
+        "pretrained_model_name_or_path": config["model_id"],
+        "torch_dtype": dtype,
+        "use_safetensors": True,
+        "cache_dir": CACHE_DIR,
+        "token": HF_TOKEN,
+        "local_files_only": OFFLINE_MODE,
+    }
+    if pipeline_type == "sd15":
+        load_kwargs.update(
+            {
+                "safety_checker": None,
+                "requires_safety_checker": False,
+            }
+        )
 
-    if is_gpu:
+    pipeline = pipeline_class.from_pretrained(**load_kwargs)
+
+    if is_gpu and hasattr(pipeline, "scheduler"):
         pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
             pipeline.scheduler.config,
             algorithm_type="dpmsolver++",
@@ -235,7 +475,7 @@ def build_pipeline(device):
 
     pipeline = pipeline.to(device)
 
-    if is_gpu:
+    if is_gpu and hasattr(pipeline, "unet"):
         pipeline.unet.to(memory_format=torch.channels_last)
 
     if ENABLE_ATTENTION_SLICING:
@@ -249,34 +489,49 @@ def build_pipeline(device):
         except Exception as exc:
             print(f"xFormers attention unavailable, continuing without it: {exc}")
 
-    if is_gpu and ENABLE_TORCH_COMPILE and hasattr(torch, "compile"):
+    if is_gpu and ENABLE_TORCH_COMPILE and hasattr(torch, "compile") and hasattr(pipeline, "unet"):
         print("Compiling UNet. First generation will be slower; later generations may be faster.")
         pipeline.unet = torch.compile(pipeline.unet, mode="reduce-overhead", fullgraph=False)
 
     return pipeline
 
 
-def load_gpu_pipeline():
-    global gpu_pipeline
+def load_gpu_pipeline(model_choice):
+    global gpu_pipeline, gpu_pipeline_choice
     if not CUDA_AVAILABLE:
         return False
+    if gpu_pipeline is not None and gpu_pipeline_choice != model_choice:
+        print(f"Unloading GPU pipeline for {gpu_pipeline_choice}")
+        gpu_pipeline = None
+        gpu_pipeline_choice = None
+        clear_memory(release_cuda_cache=True)
+
     if gpu_pipeline is None:
         clear_memory(release_cuda_cache=True)
         try:
-            gpu_pipeline = build_pipeline("cuda")
+            gpu_pipeline = build_pipeline(model_choice, "cuda")
+            gpu_pipeline_choice = model_choice
             allocated = torch.cuda.memory_allocated(0) / 1024**3
             print(f"GPU pipeline ready. Allocated memory: {allocated:.2f} GB")
         except Exception:
             gpu_pipeline = None
+            gpu_pipeline_choice = None
             raise
     return True
 
 
-def load_cpu_pipeline():
-    global cpu_pipeline
+def load_cpu_pipeline(model_choice):
+    global cpu_pipeline, cpu_pipeline_choice
+    if cpu_pipeline is not None and cpu_pipeline_choice != model_choice:
+        print(f"Unloading CPU pipeline for {cpu_pipeline_choice}")
+        cpu_pipeline = None
+        cpu_pipeline_choice = None
+        clear_memory()
+
     if cpu_pipeline is None:
         clear_memory()
-        cpu_pipeline = build_pipeline("cpu")
+        cpu_pipeline = build_pipeline(model_choice, "cpu")
+        cpu_pipeline_choice = model_choice
         print("CPU pipeline ready")
     return True
 
@@ -305,6 +560,7 @@ def generate_with_pipeline(pipeline, prompt, device, steps, guidance, width, hei
 def generate_image(
     prompt,
     device_choice,
+    model_choice,
     offline_mode,
     gpu_memory_percent,
     num_inference_steps,
@@ -318,6 +574,11 @@ def generate_image(
     prompt = (prompt or "").strip()
     if not prompt:
         return None, "Please enter a prompt."
+
+    try:
+        selected_config = model_config(model_choice)
+    except ValueError as exc:
+        return None, str(exc)
 
     width = int(width)
     height = int(height)
@@ -342,7 +603,7 @@ def generate_image(
                 return None, "GPU was selected, but CUDA is not available in this container."
 
             memory_status = configure_gpu_memory_limit(gpu_memory_percent)
-            load_gpu_pipeline()
+            load_gpu_pipeline(model_choice)
             image = generate_with_pipeline(
                 gpu_pipeline,
                 prompt,
@@ -355,7 +616,7 @@ def generate_image(
             device_used = "GPU"
         elif device_choice == "CPU":
             memory_status = "GPU memory limit is ignored for CPU generation."
-            load_cpu_pipeline()
+            load_cpu_pipeline(model_choice)
             image = generate_with_pipeline(
                 cpu_pipeline,
                 prompt,
@@ -380,6 +641,7 @@ def generate_image(
         offline_status = "Offline model loading: on." if OFFLINE_MODE else "Offline model loading: off."
         return image, (
             f"Generated using {device_used} in {elapsed:.1f}s.\n"
+            f"Model: {selected_config['model_id']} ({selected_config['pipeline_type']}).\n"
             f"{size_status}\n"
             f"{memory_status}\n"
             f"{offline_status}"
@@ -431,6 +693,34 @@ def create_interface():
                     value="GPU" if CUDA_AVAILABLE else "CPU",
                     label="Device",
                     info="GPU is preferred when available.",
+                )
+
+                model_choice = gr.Radio(
+                    choices=list(MODEL_OPTIONS.keys()),
+                    value=DEFAULT_MODEL_CHOICE,
+                    label="Model",
+                    info="Supported choices switch at runtime and download into the cache volume on first use.",
+                )
+
+                gpu_recommendations = gr.Textbox(
+                    label=(
+                        "GPU And Model Recommendations"
+                        if CUDA_AVAILABLE
+                        else "CPU And Model Recommendations"
+                    ),
+                    value=initial_model_recommendation_text(
+                        "GPU" if CUDA_AVAILABLE else "CPU",
+                        clamp(DEFAULT_GPU_MEMORY_PERCENT, 40, 100),
+                    ),
+                    lines=12,
+                    interactive=False,
+                )
+
+                model_status = gr.Textbox(
+                    label="Selected Model",
+                    value=selected_model_status(DEFAULT_MODEL_CHOICE),
+                    lines=3,
+                    interactive=False,
                 )
 
                 offline_toggle = gr.Checkbox(
@@ -502,6 +792,8 @@ def create_interface():
                         **Internal Generation Size:** Stable Diffusion v1.5 works best around `512-1024px`. This app caps the largest generated side at `{MAX_GENERATION_DIMENSION}px` by default, then upscales when the requested output is larger.
 
                         **GPU Memory Limit:** Limits how much visible VRAM this app may use. It helps prevent out-of-memory errors, but raising it does not automatically make normal `512x512` generation faster.
+
+                        **Model Selection:** Supported models are switched at runtime. The first generation with a new model downloads it into the Docker cache volume, then later runs reuse the cached files. A Docker rebuild is only needed after app code or dependency changes.
                         """
                     )
                 generate_btn = gr.Button("Generate Image", variant="primary", size="lg")
@@ -518,7 +810,8 @@ def create_interface():
             **GPU Name:** {gpu_name}
             **PyTorch Version:** {torch.__version__}
             **PyTorch CUDA Runtime:** {cuda_runtime}
-            **Model:** {MODEL_ID}
+            **Configured MODEL_ID:** {MODEL_ID}
+            **Default Model Choice:** {DEFAULT_MODEL_CHOICE}
             **Cache Directory:** {CACHE_DIR}
             **Offline Model Loading:** {OFFLINE_MODE}
             **GPU Preload:** {PRELOAD_GPU}
@@ -535,6 +828,7 @@ def create_interface():
             inputs=[
                 prompt_input,
                 device_choice,
+                model_choice,
                 offline_toggle,
                 gpu_memory_slider,
                 steps_slider,
@@ -543,6 +837,30 @@ def create_interface():
                 height_slider,
             ],
             outputs=[output_image, status_text],
+        )
+
+        device_choice.change(
+            fn=describe_model_options,
+            inputs=[device_choice, gpu_memory_slider],
+            outputs=[gpu_recommendations, model_choice, gpu_memory_slider, model_status],
+        )
+
+        gpu_memory_slider.change(
+            fn=describe_model_options,
+            inputs=[device_choice, gpu_memory_slider],
+            outputs=[gpu_recommendations, model_choice, gpu_memory_slider, model_status],
+        )
+
+        model_choice.change(
+            fn=model_generation_defaults,
+            inputs=[model_choice],
+            outputs=[
+                model_status,
+                steps_slider,
+                guidance_slider,
+                width_slider,
+                height_slider,
+            ],
         )
 
     return interface
@@ -555,7 +873,7 @@ if __name__ == "__main__":
         configure_gpu_memory_limit(DEFAULT_GPU_MEMORY_PERCENT)
     if PRELOAD_GPU and CUDA_AVAILABLE:
         print("Preloading GPU pipeline at startup.")
-        load_gpu_pipeline()
+        load_gpu_pipeline(DEFAULT_MODEL_CHOICE)
     else:
         print("Pipelines will be loaded on first use.")
 
