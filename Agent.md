@@ -54,8 +54,9 @@ docker compose run --rm ai-image-generator-gpu /app/verify-system.sh
 
 ## Model And Cache Behavior
 
-The default SD 1.5 model is `stable-diffusion-v1-5/stable-diffusion-v1-5`.
-Override it with:
+The GPU UI selects its default model from visible VRAM unless
+`DEFAULT_MODEL_CHOICE` is set. The fallback `MODEL_ID` remains
+`stable-diffusion-v1-5/stable-diffusion-v1-5`. Override it with:
 
 ```bash
 MODEL_ID=some/model-id docker compose up
@@ -78,7 +79,8 @@ If using a gated Hugging Face model, pass a token through `HF_TOKEN` or
 - Confirm Docker can see the GPU with `docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi`.
 - Check app logs for `PyTorch CUDA runtime`, GPU name, and compute capability.
 - For RTX 5080, expect compute capability `12.0`.
-- If generation runs out of memory, test `512x512`, 20 steps, guidance `7.5`.
+- If generation runs out of memory, choose a lighter model, lower the internal
+  generation limit, or test `512x512`, 20 steps, guidance `7.5`.
 - If the model cannot load, verify the Hugging Face cache volume and network
   access before changing code.
 

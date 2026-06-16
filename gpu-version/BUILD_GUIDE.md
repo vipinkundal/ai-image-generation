@@ -103,8 +103,9 @@ Use the **Offline Mode** checkbox in the web interface, or set
 ## Runtime Model Selection
 
 The web interface can inspect the visible GPU, show available VRAM, and recommend
-the best supported model for the configured GPU memory limit. Supported runtime
-choices are loaded on demand and cached in the existing Docker volumes.
+the best supported model for the automatically selected per-model GPU memory
+cap. Supported runtime choices are loaded on demand and cached in the existing
+Docker volumes.
 
 Changing between supported models in the UI does **not** rebuild the Docker
 image. The first generation with a new model downloads that model into the cache
@@ -119,7 +120,11 @@ docker compose up -d --build
 Current built-in runtime choices:
 
 - `stabilityai/stable-diffusion-xl-base-1.0`: recommended quality upgrade for
-  GPUs with around 12 GB or more usable VRAM.
+  GPUs with more than 16 GiB of usable VRAM. On 16 GB-class cards, select it
+  manually only with a lower internal generation limit.
+- `segmind/SSD-1B`: SDXL-compatible lower-VRAM option for GPUs with around
+  10 GB or more usable VRAM.
+- `stabilityai/sdxl-turbo`: fast SDXL draft model that uses very few steps.
 - `stable-diffusion-v1-5/stable-diffusion-v1-5`: legacy, fast, low-VRAM option.
 
 Newer model families such as FLUX.2 or Z-Image need separate pipeline and
@@ -172,19 +177,24 @@ HUGGING_FACE_HUB_TOKEN=...
 - `HF_HUB_OFFLINE=1`: force cached model files only
 - `PRELOAD_GPU=1`: load the GPU pipeline at app startup, default disabled so
   the UI offline switch can be selected before model loading
-- `GPU_MEMORY_PERCENT=80`: default PyTorch GPU memory limit shown in the UI
+- `MAX_GPU_MEMORY_PERCENT=95`: highest automatic GPU memory cap allowed for the
+  app, leaving headroom for driver and non-PyTorch allocations
 - `MAX_GENERATION_DIMENSION=1024`: largest side used for the actual diffusion
   pass before upscaling
 - `MAX_OUTPUT_DIMENSION=4096`: largest final output side exposed in the UI
 - `ENABLE_ATTENTION_SLICING=1`: reduce VRAM use but usually slow generation
+- `ENABLE_VAE_SLICING=1`: decode SDXL images in smaller pieces to reduce VRAM
+  pressure, default enabled
+- `ENABLE_VAE_TILING=1`: tile VAE decode to reduce SDXL peak VRAM, default
+  enabled
 - `ENABLE_TORCH_COMPILE=1`: compile the UNet; first run is slower, repeated
   same-size generations may become faster
 
 ## Speed Notes
 
-The GPU app uses a DPM multistep scheduler by default, so `16-20` steps is a
-good starting range for `512x512`. Higher step counts increase runtime almost
-linearly.
+The GPU app keeps SDXL-family models on their native scheduler and uses the DPM
+multistep scheduler for SD 1.5. For most models, `16-20` steps is a good
+starting range. Higher step counts increase runtime almost linearly.
 
 The first generation after starting the container can be much slower than later
 prompts because it may include model download, cache verification, and loading
@@ -195,18 +205,24 @@ SDXL at `1024x1024` is substantially heavier than SD 1.5 at `512x512`. Use SDXL
 for better quality, but test prompts at fewer steps or smaller sizes when you
 are iterating quickly.
 
+For large final outputs such as `2200x1800`, keep the **Internal Generation
+Limit** at `768px` first on 16 GB-class GPUs. The app will generate smaller
+internally for that aspect ratio, then upscale to `2200x1800`. Raising the
+internal limit toward `896px` or `1024px` improves detail but can exceed the
+available VRAM during SDXL VAE decode.
+
 For best speed:
 
 - Use the shared model cache volume so generation does not download files.
 - Keep output size at `512x512` while testing prompts.
 - Leave `ENABLE_ATTENTION_SLICING=0` unless you hit VRAM limits.
+- Keep `ENABLE_VAE_SLICING=1` and `ENABLE_VAE_TILING=1` for SDXL on 16 GB GPUs.
 - Try `ENABLE_TORCH_COMPILE=1` only if you generate many images at the same
   size and can tolerate a slower first generation.
 
-The GPU memory slider limits how much visible VRAM PyTorch may use. It does not
-pre-allocate VRAM and higher values are not automatically faster, but raising it
-can help prevent out-of-memory errors when using larger images or heavier
-settings.
+The app selects the PyTorch GPU memory cap automatically from the selected model.
+If a model runs out of memory, choose a lighter model, reduce the output size, or
+lower the **Internal Generation Limit**.
 
 ## 4K Output
 
@@ -244,6 +260,29 @@ Start with:
 Increase output resolution only after the baseline works. For 4K output, keep
 `MAX_GENERATION_DIMENSION=1024` first, then raise it only if the GPU has enough
 VRAM.
+
+If an error says a process has a huge value such as `17179869184 GiB` in use,
+that is a PyTorch error-message formatting issue. The number is bytes, not GiB;
+`17179869184` bytes is `16 GiB`. The app normalizes this message in the UI.
+
+The automatic GPU cap is a hard per-process limit. SDXL Base uses the highest
+configured cap, while lighter models use lower caps. Avoid `100%` for normal use
+because the NVIDIA driver and non-PyTorch allocations still need headroom,
+especially during SDXL VAE decode.
+
+### CUDA Device Not Ready
+
+If generation fails with `CUDA driver error: device not ready`, the CUDA context
+may be unhealthy after an earlier out-of-memory failure or a heavy SDXL decode.
+The app unloads its pipelines after this error, but the most reliable recovery
+is restarting the container:
+
+```bash
+docker compose restart ai-image-generator-gpu
+```
+
+For SDXL on a 16 GB GPU, keep VAE slicing and tiling enabled, and try SSD-1B,
+SDXL Turbo, or Stable Diffusion 1.5 if SDXL Base keeps running out of memory.
 
 ### Model Load Fails
 

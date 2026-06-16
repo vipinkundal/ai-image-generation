@@ -17,14 +17,16 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7860
-      - GPU_MEMORY_PERCENT=80
       - MAX_GENERATION_DIMENSION=1024
       - MAX_OUTPUT_DIMENSION=4096
+      - ENABLE_VAE_SLICING=1
+      - ENABLE_VAE_TILING=1
       # Runtime performance settings
       - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
       - CUDA_LAUNCH_BLOCKING=0
       - TORCH_CUDNN_V8_API_ENABLED=1
       - TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+      - MAX_GPU_MEMORY_PERCENT=95
     restart: unless-stopped
     deploy:
       resources:
